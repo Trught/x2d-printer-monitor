@@ -1,0 +1,11 @@
+# Recordings and personal data
+*.csv
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

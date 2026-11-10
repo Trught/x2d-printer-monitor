@@ -1,0 +1,167 @@
+# X2D Printer Monitor
+
+Live status window for a **Bambu Lab X2D** on your local network. It shows temperatures, fans, both hotends, the AMS and alerts, with charts, and measures how long each hotend switch takes.
+
+It works without Bambu Studio, Bambu Handy or the cloud, and it is **read-only**: the only message it sends to the printer is the standard "send me the full status" request. It never moves, heats or changes anything.
+
+![Printer Monitor during a two-hotend print](docs/screenshot.jpg)
+
+## What you get
+
+- **Status:** print state, progress, layer, time left, current stage (heating, changing filament, cleaning nozzle…), speed mode, and how often the printer sends updates.
+- **Temperatures:** both hotends, bed and chamber, with their targets.
+- **Fans:** part cooling, left and right auxiliary fans, chamber exhaust, hotend fan, and the others the printer reports, in percent.
+- **Hotends:** for Main (left) and Aux (right): nozzle size, flow type and material, the loaded filament (colour, type, AMS slot, amount left), and what the hotend is doing.
+- **Hotend switch timing:** every switch with its duration, the time since the previous switch, the layer, and the steps the printer reported. Also a summary: count, last, average, min/max, and total time spent switching.
+- **Charts:** temperature and fan history for the last 2 min to 2 h, or everything. Dotted lines mark hotend switches. A band under the fan chart shows which hotend was active. Hover to read values, and click a legend entry to hide or show a line.
+- **AMS:** every unit with temperature, humidity and drying state, and every slot with colour, material and remaining amount. Slots that feed a hotend are marked.
+- **Alerts:** HMS alerts and print errors, with Bambu Studio's English message text when available.
+- **Export:** **Save CSV…** saves the recorded history (one row per second, up to 12 hours) plus a separate file of hotend switches. **Record raw…** saves every message the printer sends, for later analysis.
+
+## Before you start
+
+1. **Printer in LAN mode.** In the printer's network settings, turn on **LAN Only Mode**. Developer Mode is not needed just to read status.
+2. **The LAN access code.** It's shown on the same printer screen (8 characters).
+3. **The printer's IP address.** Also on the network screen, for example `192.168.1.207`. Your computer must be on the same network.
+4. **Python 3.9 or newer with Tkinter.** Nothing needs to be installed with `pip` for the window.
+   - **macOS:** the Python from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python-tk`). The Python that comes with macOS has an old Tk that can't open windows on recent macOS, so the launcher skips it.
+   - **Windows:** the Python from [python.org](https://www.python.org/downloads/). Tick *"Add python.exe to PATH"* during setup.
+
+## Start the window
+
+- **macOS:** double-click **`Printer Monitor.command`**. The first time, macOS may block it: right-click it, choose *Open*, then confirm. If it says it is not executable, run `chmod +x "Printer Monitor.command"` once in Terminal.
+- **Windows:** double-click **`Printer Monitor.bat`**.
+- **Any system, from a terminal:**
+
+  ```sh
+  python3 printer_gui.py
+  ```
+
+Then:
+
+1. Type the printer's **IP address** and the **access code**.
+2. Leave **Serial** empty. The monitor reads it from the printer and fills it in.
+3. Press **Connect** (or Return). The dot turns green and values appear within a second or two.
+
+Tick **Remember access code on this computer** if you don't want to type it each time. It's saved in plain text in `~/.bambu-printer-monitor.json` (readable only by your user account). The IP address and chart range are always remembered.
+
+If the network drops, the monitor reconnects by itself every 5 seconds. A wrong access code stops it with **Login refused**.
+
+## Using it
+
+| Control | What it does |
+|---|---|
+| **Show last** | chart range: 2 min, 10 min, 30 min, 2 h or All |
+| **Freeze view** | stops the charts scrolling so you can study them; recording continues |
+| **Clear history** | empties the charts and the switch list |
+| **Save CSV…** | saves everything recorded, plus `…-switches.csv` if there were switches |
+| **Record raw… / Stop recording** | saves every printer message to a `.jsonl` file until you stop it |
+| **Log part-cooling and hotend fan changes** | these change every second or two, so they are left out of the Events tab unless ticked |
+
+The tabs at the bottom:
+
+- **Events:** fan changes, hotend switches, and changes of state, stage, speed and air-duct mode. New alerts are logged here too.
+- **Hotend switches:** one row per switch.
+- **AMS:** units and slots.
+- **Alerts:** each alert or error, when it started and when it cleared.
+
+### Alert texts
+
+The printer sends only alert codes. The text comes from the alert files that Bambu Studio downloads. Connect Bambu Studio to the printer once on the same computer, and the monitor finds the files by itself:
+
+- macOS: `~/Library/Application Support/BambuStudio/hms/`
+- Windows: `%APPDATA%\BambuStudio\hms\`
+
+Without them, alerts are still shown, as codes.
+
+### How switch times are measured
+
+Each printer message says which hotend is active and whether the hotends are idle, busy or switching. A switch starts at the first message that shows "busy" or "switching", or a different hotend. It ends at the first "idle" message on the new hotend.
+
+- **Precision** is one message interval, about 1 second on the X2D (shown in the status line as "reports every …").
+- A switch that happens entirely between two messages is counted but marked **not timed**.
+- Busy periods that end on the same hotend (loading or unloading filament) are not counted as switches.
+- The time shown is the printer's own "switching" phase. Wiping and reheating before and after it are not included.
+
+## Terminal version (optional)
+
+`monitor.py` prints one status line per second, with separate `EVENT` lines for fan changes, hotend switches and state changes. It's useful for logging over a long print, or on a computer without a screen. It needs the `paho-mqtt` package and the printer's serial number:
+
+```sh
+python3 -m venv ~/.venvs/bambu-lan
+~/.venvs/bambu-lan/bin/pip install paho-mqtt
+
+export BAMBU_ACCESS_CODE=12345678      # or leave it out and type it when asked
+~/.venvs/bambu-lan/bin/python monitor.py --serial <SERIAL> --csv log.csv
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--ip` | `192.168.1.207` | printer address |
+| `--serial` | required | printer serial number (printer screen, or the window's Serial field) |
+| `--code` | `$BAMBU_ACCESS_CODE`, else asked | LAN access code |
+| `--interval` | 1 s | time between status lines and CSV rows |
+| `--pushall` | 300 s | time between full-status requests |
+| `--csv FILE` | off | append one row per interval |
+| `--raw FILE` | off | append every printer message (JSON lines) |
+| `--quiet` | off | print only `EVENT` lines |
+
+Example output:
+
+```
+14:02:11 RUNNING 42% L10/80 33min | active=Aux | Main 150/150  Aux 220/220  bed 65/65  chamber 38 | Aux left 30%  Aux right 30%  Exhaust 70%  Parts 100% duct=cooling
+14:02:12 EVENT active=Main L10: Aux left 30% -> 0%; active Aux -> Main
+```
+
+Stop it with Ctrl+C.
+
+## Troubleshooting
+
+| Problem | What to check |
+|---|---|
+| Nothing happens after Connect, then "reconnecting" | Wrong IP, printer off, or the computer is on another network or guest Wi-Fi. LAN Only Mode must be on. |
+| **Login refused** | Wrong access code. Check it on the printer screen again; it can change when LAN mode is turned off and on. |
+| The window doesn't open on macOS | The launcher found no Python with a working Tk. Install Python from python.org and try again. |
+| Alerts show only codes | Connect Bambu Studio to the printer once (see *Alert texts*). |
+| A fan or hotend is missing | The monitor shows only what the printer reports. Some fans appear only in certain air-duct modes. |
+
+## Other printers
+
+The monitor is written and tested for the X2D. Printers that send the same fields, such as the H2D and H2C, should mostly work. Single-hotend printers show one hotend, called Main. On other printers, the hotend and fan names follow the X2D's layout and may not match yours.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `printer_gui.py` | the window, charts and the built-in MQTT client |
+| `printer_report.py` | decoding of stage, speed, nozzles, AMS, alerts and switch timing |
+| `monitor.py` | temperature and fan decoding (shared) and the terminal version |
+| `Printer Monitor.command` / `.bat` | double-click launchers for macOS / Windows |
+
+Keep your CSV and raw recordings, and your access code, out of this repository. `.gitignore` already excludes `*.csv` and `*.jsonl`.
+
+## How it works
+
+The printer runs an MQTT server on port 8883 (TLS, user `bblp`, password = the access code). The monitor subscribes to `device/<serial>/report` and sends one `pushall` request to `device/<serial>/request` every 5 minutes. The printer then sends a full status message, and small change messages in between. The serial number is read from the printer's TLS certificate. The printer uses a self-signed certificate, so it isn't verified.
+
+Field decoding follows the open-source device code of [Bambu Studio](https://github.com/bambulab/BambuStudio) (version 02.09.01.70), mainly `src/slic3r/GUI/DeviceCore/`:
+
+| Shown | Printer field | Bambu Studio source |
+|---|---|---|
+| fans | `device.airduct.parts[]`: fan id = bits 4–11 of `id`, `state` = % | `DevFan.cpp` |
+| fan names | Aux left = fan 2 (`M106 P2`), Aux right = fan 10 (`M106 P10`), Exhaust = fan 3 | `FanControl.cpp`, `resources/printers/N6.json` |
+| active / target hotend, switch state | `device.extruder.state` bits 4–7 / 8–11 / 12–14 | `DevExtruderSystem.cpp` |
+| hotend temperatures, step, loaded slot | `device.extruder.info[]`: `temp`, `stat`, `snow` | `DevExtruderSystem.cpp` |
+| hotend names | id 0 = Aux (right), id 1 = Main (left) | `tool_head_display_names` in `N6.json` |
+| nozzles | `device.nozzle.info[]`: diameter, type, wear | `DevNozzleSystem.cpp` |
+| stage, speed | `stg_cur`, `spd_lvl`, `spd_mag` | `DeviceManager.cpp` |
+| AMS | `ams.ams[]`, `vir_slot` (external spools) | `DevFilaSystem.cpp` |
+| alerts | `hms[]`, `print_error` | `DevHMS.cpp` |
+
+Bambu's closed networking plugin is not used.
+
+## Credits and license
+
+The stage, filament-step and fan tables are taken from Bambu Studio, which is licensed under the AGPL-3.0. If you publish this project, AGPL-3.0 is the natural license for it. No license file has been added yet.
+
+Not affiliated with or endorsed by Bambu Lab.
