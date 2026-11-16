@@ -4,7 +4,7 @@ Live status window for a **Bambu Lab X2D** on your local network. It shows tempe
 
 It works without Bambu Studio, Bambu Handy or the cloud. By default it is **read-only**: the only message it sends to the printer is the standard "send me the full status" request. It can also pause, resume or stop a print and set the light, speed, air duct mode and target temperatures, but only after you tick **Enable controls** (see [Controls](#controls)).
 
-![Printer Monitor during a two-hotend print](docs/screenshot.jpg)
+![Printer Monitor window with the Controls row enabled](docs/screenshot.jpg)
 
 ## What you get
 
@@ -79,7 +79,7 @@ The Controls row is greyed out until you tick **Enable controls**. The tick is n
 
 Every command is written to the Events tab in blue, followed by the printer's answer. The light, speed and air-duct controls follow the printer, so changes made on the printer's screen or in Bambu Studio show up here too.
 
-The controls were tested against a simulated printer, not yet on a real X2D. Try the chamber light first.
+Setting hotend and bed targets has been confirmed on a real X2D (the Events tab in the screenshot shows the printer answering `success`). The other controls were tested against a simulated printer only.
 
 ### Alert texts
 
