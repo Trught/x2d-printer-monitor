@@ -2,7 +2,7 @@
 
 Live status window for a **Bambu Lab X2D** on your local network. It shows temperatures, fans, both hotends, the AMS and alerts, with charts, and measures how long each hotend switch takes.
 
-It works without Bambu Studio, Bambu Handy or the cloud, and it is **read-only**: the only message it sends to the printer is the standard "send me the full status" request. It never moves, heats or changes anything.
+It works without Bambu Studio, Bambu Handy or the cloud. By default it is **read-only**: the only message it sends to the printer is the standard "send me the full status" request. It can also pause, resume or stop a print and set the light, speed, air duct mode and target temperatures, but only after you tick **Enable controls** (see [Controls](#controls)).
 
 ![Printer Monitor during a two-hotend print](docs/screenshot.jpg)
 
@@ -16,11 +16,12 @@ It works without Bambu Studio, Bambu Handy or the cloud, and it is **read-only**
 - **Charts:** temperature and fan history for the last 2 min to 2 h, or everything. Dotted lines mark hotend switches. A band under the fan chart shows which hotend was active. Hover to read values, and click a legend entry to hide or show a line.
 - **AMS:** every unit with temperature, humidity and drying state, and every slot with colour, material and remaining amount. Slots that feed a hotend are marked.
 - **Alerts:** HMS alerts and print errors, with Bambu Studio's English message text when available.
+- **Controls** (optional): pause, resume, stop, chamber light, speed, air duct mode, target temperatures, silence the buzzer.
 - **Export:** **Save CSV…** saves the recorded history (one row per second, up to 12 hours) plus a separate file of hotend switches. **Record raw…** saves every message the printer sends, for later analysis.
 
 ## Before you start
 
-1. **Printer in LAN mode.** In the printer's network settings, turn on **LAN Only Mode**. Developer Mode is not needed just to read status.
+1. **Printer in LAN mode.** In the printer's network settings, turn on **LAN Only Mode**. Developer Mode is not needed just to read status; it is needed for the Controls row.
 2. **The LAN access code.** It's shown on the same printer screen (8 characters).
 3. **The printer's IP address.** Also on the network screen, for example `192.168.1.207`. Your computer must be on the same network.
 4. **Python 3.9 or newer with Tkinter.** Nothing needs to be installed with `pip` for the window.
@@ -64,6 +65,21 @@ The tabs at the bottom:
 - **Hotend switches:** one row per switch.
 - **AMS:** units and slots.
 - **Alerts:** each alert or error, when it started and when it cleared.
+
+### Controls
+
+The Controls row is greyed out until you tick **Enable controls**. The tick is not remembered, so the window is read-only again the next time you start it. The printer must be in **Developer Mode** to accept commands over the LAN.
+
+- **Pause**, **Resume**, **Stop…**: each is available only in the matching print state. Stop asks first.
+- **Chamber light**: on or off.
+- **Speed**: Silent, Standard, Sport or Ludicrous, while a print is running.
+- **Air duct**: Cooling or Heating, as offered by the printer.
+- **Set target °C** for the Main and Aux hotends, the bed and the chamber: type a number and press Return or **Set**. 0 switches the heater off. Limits: hotend 300, bed 120, chamber 65 °C (X2D). As in Bambu Studio, the chamber target cannot be changed in cooling mode during a print, and from 40 °C the printer switches the air duct to heating mode (the window asks first).
+- **Silence buzzer** stops an alarm that is sounding. **Prompt sound** appears only on printers that report the option (the X2D does not).
+
+Every command is written to the Events tab in blue, followed by the printer's answer. The light, speed and air-duct controls follow the printer, so changes made on the printer's screen or in Bambu Studio show up here too.
+
+The controls were tested against a simulated printer, not yet on a real X2D. Try the chamber light first.
 
 ### Alert texts
 
@@ -135,6 +151,7 @@ The monitor is written and tested for the X2D. Printers that send the same field
 |---|---|
 | `printer_gui.py` | the window, charts and the built-in MQTT client |
 | `printer_report.py` | decoding of stage, speed, nozzles, AMS, alerts and switch timing |
+| `printer_control.py` | the command messages for the Controls row |
 | `monitor.py` | temperature and fan decoding (shared) and the terminal version |
 | `Printer Monitor.command` / `.bat` | double-click launchers for macOS / Windows |
 
@@ -157,6 +174,20 @@ Field decoding follows the open-source device code of [Bambu Studio](https://git
 | stage, speed | `stg_cur`, `spd_lvl`, `spd_mag` | `DeviceManager.cpp` |
 | AMS | `ams.ams[]`, `vir_slot` (external spools) | `DevFilaSystem.cpp` |
 | alerts | `hms[]`, `print_error` | `DevHMS.cpp` |
+
+Commands sent by the Controls row, all to `device/<serial>/request` (`sequence_id` left out here):
+
+| Control | Message | Bambu Studio source |
+|---|---|---|
+| Pause / Resume / Stop | `{"print": {"command": "pause" \| "resume" \| "stop", "param": ""}}` | `DeviceManager.cpp` |
+| Chamber light | `{"system": {"command": "ledctrl", "led_node": "chamber_light", "led_mode": "on" \| "off", …}}`, then the same for `chamber_light2` | `DevLampCtrl.cpp` |
+| Speed | `{"print": {"command": "print_speed", "param": "1".."4"}}` | `DeviceManager.cpp` |
+| Air duct | `{"print": {"command": "set_airduct", "modeId": 0 \| 1, "submode": -1}}` | `DevFan.cpp` |
+| Hotend target | `{"print": {"command": "set_nozzle_temp", "extruder_index": 0 (Aux) \| 1 (Main), "target_temp": N}}`; single-hotend printers: G-code `M104 S<N>` | `DeviceManager.cpp` |
+| Bed target | `{"print": {"command": "set_bed_temp", "temp": N}}` if bit 39 of `fun` is set, else G-code `M140 S<N>` | `DeviceManager.cpp` |
+| Chamber target | `{"print": {"command": "set_ctt", "ctt_val": N}}` | `DevChamberCtrl.cpp` |
+| Silence buzzer | `{"print": {"command": "buzzer_ctrl", "mode": 0}}` | `DeviceManager.cpp` |
+| Prompt sound | `{"print": {"command": "print_option", "sound_enable": true \| false}}` | `DevPrintOptions.cpp` |
 
 Bambu's closed networking plugin is not used.
 

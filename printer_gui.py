@@ -9,7 +9,10 @@ the nozzle and filament in each hotend, live charts with hotend-switch
 markers, measured hotend-switch times, the AMS units and an event log.
 History can be saved as CSV and every report recorded as JSON lines.
 
-Read-only: the only message sent to the printer is the standard full-status
+Read-only until "Enable controls" is ticked: then the Controls row can pause,
+resume or stop the print and set the chamber light, target temperatures,
+printing speed and air duct mode (printer_control.py; the printer must be in
+Developer Mode). Otherwise the only message sent is the standard full-status
 request ("pushall"). Standard library only (Tkinter + a small MQTT 3.1.1
 client); field decoding is shared with monitor.py.
 """
@@ -30,6 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, font, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import printer_control as pc  # noqa: E402
 from monitor import HOTEND_NAMES, decode, deep_merge  # noqa: E402
 from printer_report import SWITCH_STATES, HmsText, SwitchTimer, decode_extras  # noqa: E402
 
@@ -91,7 +95,7 @@ class AuthError(Exception):
 
 
 class PrinterLink(threading.Thread):
-    """Minimal MQTT 3.1.1 subscriber over TLS. Posts ("status"|"serial"|"msg"|"auth", data)."""
+    """Minimal MQTT 3.1.1 client over TLS. Posts ("status"|"serial"|"msg"|"auth", data)."""
 
     CONNACK = {1: "protocol refused", 2: "client id refused", 3: "server unavailable",
                4: "bad user name or access code", 5: "not authorized (wrong access code?)"}
@@ -101,9 +105,18 @@ class PrinterLink(threading.Thread):
         self.host, self.code, self.serial, self.out = host, code, serial, out
         self.stop_event = threading.Event()
         self.sock = None
+        self.online = False
+        self.outbox: queue.Queue = queue.Queue()
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def publish(self, msg: dict) -> bool:
+        """Queue a request for the printer; refused while not connected, so nothing is sent late."""
+        if not self.online or self.stop_event.is_set():
+            return False
+        self.outbox.put(msg)
+        return True
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -118,6 +131,7 @@ class PrinterLink(threading.Thread):
                 self.out.put(("status", ("error", f"Connection lost: {e}. Retrying in 5 s")))
                 self.stop_event.wait(5)
             finally:
+                self.online = False
                 if self.sock:
                     try:
                         self.sock.close()
@@ -185,10 +199,19 @@ class PrinterLink(threading.Thread):
         self._send(_packet(0x82, (1).to_bytes(2, "big") + _str(report) + b"\x00"))
         self._pushall(request)
         self.out.put(("status", ("ok", f"Connected to {self.host}")))
+        while not self.outbox.empty():
+            self.outbox.get_nowait()
+        self.online = True
 
         last_ping = last_push = time.time()
         while not self.stop_event.is_set():
-            pkt = self._read(1.0)
+            while True:
+                try:
+                    msg = self.outbox.get_nowait()
+                except queue.Empty:
+                    break
+                self._send(_packet(0x30, _str(request) + json.dumps(msg).encode()))
+            pkt = self._read(0.25)
             now = time.time()
             if now - last_ping > 30:
                 self._send(b"\xc0\x00")
@@ -479,7 +502,7 @@ class App:
         self.root = root
         root.title(APP_TITLE)
         root.geometry("1240x1000")
-        root.minsize(1000, 780)
+        root.minsize(1000, 860)
         base = font.nametofont("TkDefaultFont")
         fam, size = base.actual("family"), abs(base.actual("size"))
         self.f_small = font.Font(family=fam, size=max(size - 2, 9))
@@ -509,6 +532,9 @@ class App:
         self.ams_sig = None
         self.raw_fh = None
         self.raw_count = 0
+        self.controls: dict = {}        # decoded by printer_control.decode_controls
+        self.sent: dict = {}            # sequence id -> description, to match the printer's replies
+        self.hold: dict = {}            # control -> time until which the report must not overwrite it
 
         self.settings = self._load_settings()
         self._build()
@@ -633,14 +659,16 @@ class App:
         self.switch_lbl = ttk.Label(self.hot_box, text="Hotend switches: none measured yet", foreground=INK2)
         self.switch_lbl.grid(row=2, column=0, columnspan=5, sticky="w", padx=8, pady=(4, 4))
 
+        self._build_controls(r, pad)
+
         # charts
         charts = ttk.Frame(r)
         charts.pack(fill="both", expand=True, **pad)
         self.temp_chart = Chart(self, charts, "Temperatures", "°C", TEMP_SERIES)
         self.fan_chart = Chart(self, charts, "Fans", "%", FAN_SERIES, fixed_max=100, step=True)
         self.fan_chart.hidden = {"fan_Hotend", "fan_Hotend1"}  # flips 90/100 % every second; click to show
-        self.temp_chart.canvas.config(height=170)
-        self.fan_chart.canvas.config(height=170)
+        self.temp_chart.canvas.config(height=130)   # minimum; both charts take the spare height
+        self.fan_chart.canvas.config(height=130)
         self.strip = HotendStrip(self, charts)
         self.temp_chart.canvas.pack(fill="both", expand=True)
         self.fan_chart.canvas.pack(fill="both", expand=True, pady=(6, 0))
@@ -677,6 +705,7 @@ class App:
         self.events.config(yscrollcommand=sb.set, state="disabled")
         self.events.tag_config("switch", font=self.f_bold)
         self.events.tag_config("alert", foreground=STATUS["error"])
+        self.events.tag_config("sent", foreground=SLOTS[0])
         sb.pack(side="right", fill="y")
         self.events.pack(fill="both", expand=True, padx=4, pady=4)
 
@@ -708,6 +737,217 @@ class App:
         self.al_tree.config(yscrollcommand=sb3.set)
         sb3.pack(side="right", fill="y")
         self.al_tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+    # ---- controls
+    def _build_controls(self, r, pad) -> None:
+        box = ttk.LabelFrame(r, text="Controls")
+        box.pack(fill="x", **pad)
+        row = ttk.Frame(box)
+        row.pack(fill="x", padx=8, pady=(4, 2))
+        self.ctl_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Enable controls", variable=self.ctl_on,
+                        command=self._refresh_controls).pack(side="left")
+        self.pause_btn = ttk.Button(row, text="Pause", width=7, command=lambda: self._send(pc.pause()))
+        self.resume_btn = ttk.Button(row, text="Resume", width=7, command=lambda: self._send(pc.resume()))
+        self.stop_btn = ttk.Button(row, text="Stop…", width=7, command=self._stop_print)
+        self.pause_btn.pack(side="left", padx=(16, 2))
+        self.resume_btn.pack(side="left", padx=2)
+        self.stop_btn.pack(side="left", padx=2)
+        self.light_var = tk.BooleanVar(value=False)
+        self.light_chk = ttk.Checkbutton(row, text="Chamber light", variable=self.light_var, command=self._set_light)
+        self.light_chk.pack(side="left", padx=(16, 0))
+        ttk.Label(row, text="Speed").pack(side="left", padx=(16, 4))
+        self.speed_var = tk.StringVar()
+        self.speed_cb = ttk.Combobox(row, textvariable=self.speed_var, values=list(pc.SPEED_LEVELS.values()),
+                                     width=10, state="disabled")
+        self.speed_cb.pack(side="left")
+        self.speed_cb.bind("<<ComboboxSelected>>", lambda e: self._set_speed())
+        ttk.Label(row, text="Air duct").pack(side="left", padx=(16, 4))
+        self.duct_var = tk.StringVar()
+        self.duct_cb = ttk.Combobox(row, textvariable=self.duct_var, values=[], width=10, state="disabled")
+        self.duct_cb.pack(side="left")
+        self.duct_cb.bind("<<ComboboxSelected>>", lambda e: self._set_duct())
+        self.buzzer_btn = ttk.Button(row, text="Silence buzzer", command=lambda: self._send(pc.stop_buzzer()))
+        self.buzzer_btn.pack(side="left", padx=(16, 0))
+        self.sound_var = tk.BooleanVar(value=False)
+        self.sound_chk = ttk.Checkbutton(row, text="Prompt sound", variable=self.sound_var, command=self._set_sound)
+        self.sound_shown = False        # packed only when the printer reports that it has the option
+
+        row2 = ttk.Frame(box)
+        row2.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Label(row2, text="Set target °C (0 = off)").pack(side="left")
+        self.temp_entries: dict = {}
+        for key, label in (("Main", "Main"), ("Aux", "Aux"), ("bed", "Bed"), ("chamber", "Chamber")):
+            ttk.Label(row2, text=label).pack(side="left", padx=(14, 4))
+            var = tk.StringVar()
+            ent = ttk.Entry(row2, textvariable=var, width=5, justify="right")
+            ent.pack(side="left")
+            ent.bind("<Return>", lambda e, k=key: self._set_temp(k))
+            btn = ttk.Button(row2, text="Set", width=4, command=lambda k=key: self._set_temp(k))
+            btn.pack(side="left", padx=(3, 0))
+            self.temp_entries[key] = (var, ent, btn)
+        self.ctl_msg = ttk.Label(row2, text="", foreground=INK2)
+        self.ctl_msg.pack(side="left", padx=(16, 0))
+        self._refresh_controls()
+
+    def _controls_live(self) -> bool:
+        return bool(self.ctl_on.get() and self.link and self.link.online and self.state.get("print")
+                    and time.time() - self.last_msg < 60)
+
+    def _refresh_controls(self) -> None:
+        """Enable what the printer can do now and show its current light, speed and air duct mode."""
+        live = self._controls_live()
+        c = self.controls = pc.decode_controls(self.state.get("print") or {})
+        now = time.time()
+
+        def able(widget, on, normal="normal"):
+            widget.config(state=normal if (live and on) else "disabled")
+
+        able(self.pause_btn, c["state"] == "RUNNING")
+        able(self.resume_btn, c["state"] == "PAUSE")
+        able(self.stop_btn, c["printing"])
+        able(self.light_chk, c["light"] is not None)
+        able(self.speed_cb, c["printing"] and c["speed"], "readonly")
+        able(self.duct_cb, bool(c["duct_modes"]), "readonly")
+        able(self.buzzer_btn, True)
+        able(self.sound_chk, True)
+        if c["sound_supported"] != self.sound_shown:
+            self.sound_shown = c["sound_supported"]
+            if self.sound_shown:
+                self.sound_chk.pack(side="left", padx=(16, 0))
+            else:
+                self.sound_chk.pack_forget()
+        single = not c["extruder_ids"]
+        for key, (var, ent, btn) in self.temp_entries.items():
+            on = {"Main": True, "Aux": not single, "bed": True, "chamber": c["has_chamber"]}[key]
+            able(ent, on)
+            able(btn, on)
+
+        if now > self.hold.get("light", 0) and c["light"] is not None:
+            self.light_var.set(c["light"])
+        if now > self.hold.get("speed", 0):
+            self.speed_var.set(pc.SPEED_LEVELS.get(c["speed"], ""))
+        if now > self.hold.get("sound", 0):
+            self.sound_var.set(c["sound_on"])
+        names = [pc.airduct_name(m) for m in c["duct_modes"]]
+        if list(self.duct_cb.cget("values")) != names:
+            self.duct_cb.config(values=names)
+        if now > self.hold.get("duct", 0):
+            self.duct_var.set(pc.airduct_name(c["duct_mode"]) if c["duct_mode"] in c["duct_modes"] else "")
+        if now > self.hold.get("msg", 0):
+            if not self.ctl_on.get():
+                hint = "Tick “Enable controls” to send commands (printer in Developer Mode)."
+            elif not live:
+                hint = "Connect to the printer to use the controls."
+            else:
+                lim = c["limits"]
+                hint = f"Limits: hotend {lim['nozzle']}, bed {lim['bed']}, chamber {lim['chamber']} °C."
+            self.ctl_msg.config(text=hint, foreground=INK2)
+
+    def _note(self, text, error=False) -> None:
+        self.ctl_msg.config(text=text, foreground=STATUS["error"] if error else INK)
+        self.hold["msg"] = time.time() + 8
+
+    def _send(self, msgs, hold=None) -> bool:
+        """Publish one command (or a list that belongs together) and log it."""
+        if not self._controls_live():
+            return False
+        msgs = msgs if isinstance(msgs, list) else [msgs]
+        text = pc.describe(msgs[0])
+        for n, m in enumerate(msgs):
+            if not self.link.publish(m):
+                self._note("Not sent: the printer is not connected.", error=True)
+                return False
+            if n == 0:  # only the first answer is reported (the second light node may not exist)
+                body = m.get("print") or m.get("system") or {}
+                self.sent[body.get("sequence_id")] = pc.describe(m)
+        if len(self.sent) > 200:
+            for k in list(self.sent)[:100]:
+                del self.sent[k]
+        if hold:
+            self.hold[hold] = time.time() + 4
+        self._log("sent: " + text, "sent")
+        self._note("Sent: " + text)
+        return True
+
+    def _is_reply(self, data) -> bool:
+        """True for the printer's answer to a command (anything but a status push); logs our own."""
+        for section in ("print", "system"):
+            body = data.get(section)
+            if not isinstance(body, dict) or "command" not in body or body["command"] == "push_status":
+                continue
+            text = self.sent.pop(body.get("sequence_id"), None)
+            if text is not None and "result" in body:
+                ok = str(body["result"]).lower() == "success"
+                reason = body.get("reason") or body.get("err_code") or ""
+                line = f"printer: {text}: {body['result']}" + (f" ({reason})" if reason and not ok else "")
+                self._log(line, None if ok else "alert")
+                if not ok:
+                    self._note(line, error=True)
+            return True
+        return False
+
+    def _stop_print(self) -> None:
+        name = (self.state.get("print") or {}).get("subtask_name") or "the current print"
+        if messagebox.askyesno(APP_TITLE, f"Stop {name}?\n\nA stopped print cannot be resumed.", icon="warning",
+                               default="no"):
+            self._send(pc.stop())
+
+    def _set_light(self) -> None:
+        if not self._send(pc.chamber_light(self.light_var.get()), hold="light"):
+            self._refresh_controls()
+
+    def _set_speed(self) -> None:
+        level = next((k for k, v in pc.SPEED_LEVELS.items() if v == self.speed_var.get()), None)
+        if level and level != self.controls.get("speed"):
+            self._send(pc.speed(level), hold="speed")
+        self.speed_cb.selection_clear()
+
+    def _set_duct(self) -> None:
+        mode = next((m for m in self.controls.get("duct_modes", []) if pc.airduct_name(m) == self.duct_var.get()), None)
+        if mode is not None and mode != self.controls.get("duct_mode"):
+            self._send(pc.airduct(mode), hold="duct")
+        self.duct_cb.selection_clear()
+
+    def _set_sound(self) -> None:
+        if not self._send(pc.prompt_sound(self.sound_var.get()), hold="sound"):
+            self._refresh_controls()
+
+    def _set_temp(self, key) -> None:
+        if not self._controls_live():
+            return
+        c = self.controls
+        var = self.temp_entries[key][0]
+        limit = c["limits"]["nozzle" if key in ("Main", "Aux") else key]
+        try:
+            temp = int(var.get().strip())
+        except ValueError:
+            self._note("Enter a whole number of °C.", error=True)
+            return
+        if not 0 <= temp <= limit:
+            self._note(f"Out of range: 0 to {limit} °C.", error=True)
+            return
+        if key == "bed":
+            msg = pc.bed_temp(temp, c["bed_mqtt"])
+        elif key == "chamber":
+            # same rules as Bambu Studio's Device tab (StatusPanel::on_set_chamber_temp)
+            if c["printing"] and c["duct_mode"] == 0:
+                self._note("The chamber temperature cannot be changed in cooling mode while printing.", error=True)
+                return
+            if c["duct_mode"] != 1 and temp >= pc.CHAMBER_HEATING_FROM and not messagebox.askokcancel(
+                    APP_TITLE, f"From {pc.CHAMBER_HEATING_FROM} °C the printer switches the air duct to heating "
+                               "mode by itself. Continue?"):
+                return
+            msg = pc.chamber_temp(temp)
+        else:
+            ids = c["extruder_ids"]
+            ext = None if not ids else next((i for i in ids if HOTEND_NAMES.get(i) == key), None)
+            if ids and ext is None:
+                self._note(f"The printer does not report a {key} hotend.", error=True)
+                return
+            msg = pc.nozzle_temp(temp, ext)
+        if self._send(msg):
+            var.set("")
 
     def _value_row(self, box, key, label, colour, row, col):
         sw = tk.Canvas(box, width=12, height=12, highlightthickness=0)
@@ -761,6 +1001,11 @@ class App:
                 kind, data = self.q.get_nowait()
                 if kind == "msg":
                     now = time.time()
+                    if self._is_reply(data):   # answer to a command: not part of the status
+                        if self.raw_fh:
+                            self.raw_fh.write(json.dumps({"t": round(now, 3), "msg": data}) + "\n")
+                            self.raw_count += 1
+                        continue
                     deep_merge(self.state, data)
                     self.last_msg = now
                     self.msg_times = (self.msg_times + [now])[-60:]
@@ -775,6 +1020,7 @@ class App:
                         self.hms.load(data)
                 elif kind == "status":
                     self._set_status(*data)
+                    self._refresh_controls()
                 elif kind == "auth":
                     self._set_status("error", data)
                     self.link = None
@@ -806,6 +1052,7 @@ class App:
     # ---- sampling
     def _tick(self):
         self.root.after(1000, self._tick)
+        self._refresh_controls()
         if self.raw_fh:
             self.raw_fh.flush()
             self.raw_lbl.config(text=f"recording: {self.raw_count} messages")
