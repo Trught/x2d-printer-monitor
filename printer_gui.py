@@ -9,12 +9,14 @@ the nozzle and filament in each hotend, live charts with hotend-switch
 markers, measured hotend-switch times, the AMS units and an event log.
 History can be saved as CSV and every report recorded as JSON lines.
 
-Read-only until "Enable controls" is ticked: then the Controls row can pause,
+Passive MQTT by default. Disconnect and turn off "Passive MQTT" to request
+full status or firmware/calibration data. "Enable controls" additionally lets
+the Controls row pause,
 resume or stop the print and set the chamber light, target temperatures,
 printing speed and air duct mode (printer_control.py; the printer must be in
-Developer Mode). Otherwise the only message sent is the standard full-status
-request ("pushall"). Standard library only (Tkinter + a small MQTT 3.1.1
-client); field decoding is shared with monitor.py.
+Developer Mode). Passive mode blocks all application publishes in the transport.
+English/Czech translations are editable JSON; the Inspector preserves unknown
+fields and query replies. Standard library only (Tkinter + MQTT 3.1.1).
 """
 from __future__ import annotations
 
@@ -23,17 +25,21 @@ import csv
 import json
 import os
 import queue
-import socket
-import ssl
 import sys
-import threading
 import time
 import tkinter as tk
 from datetime import datetime
+import webbrowser
 from tkinter import filedialog, font, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bambu_monitor as lan  # noqa: E402
 import printer_control as pc  # noqa: E402
+from printer_link import PrinterLink  # noqa: E402
+from printer_discovery import DiscoveryDialog  # noqa: E402
+from printer_inspector import ReportInspector  # noqa: E402
+from printer_queries import QUERIES, build_query  # noqa: E402
+from i18n import available_languages, bind_static_text, get_language, set_language, tr  # noqa: E402
 from monitor import HOTEND_NAMES, decode, deep_merge  # noqa: E402
 from printer_report import SWITCH_STATES, HmsText, SwitchTimer, decode_extras  # noqa: E402
 
@@ -62,187 +68,6 @@ QUIET_FANS = {"Parts", "Hotend", "Hotend1", "MCBoard"}  # change constantly; log
 WINDOWS = [("2 min", 120), ("10 min", 600), ("30 min", 1800), ("2 h", 7200), ("All", None)]
 
 
-# --------------------------------------------------------------------------- MQTT
-
-def cn_from_der(der: bytes) -> str | None:
-    """Subject common name of a DER certificate (Bambu printers use the serial)."""
-    i = der.rfind(b"\x06\x03\x55\x04\x03")  # OID 2.5.4.3; the subject comes after the issuer
-    if i < 0:
-        return None
-    j = i + 5
-    length = der[j + 1]
-    if length & 0x80:
-        return None
-    return der[j + 2:j + 2 + length].decode("utf-8", "replace")
-
-
-def _str(s: str) -> bytes:
-    b = s.encode("utf-8")
-    return len(b).to_bytes(2, "big") + b
-
-
-def _packet(header: int, body: bytes) -> bytes:
-    n, out = len(body), bytearray([header])
-    while True:
-        byte, n = n % 128, n // 128
-        out.append(byte | (0x80 if n else 0))
-        if not n:
-            return bytes(out) + body
-
-
-class AuthError(Exception):
-    pass
-
-
-class PrinterLink(threading.Thread):
-    """Minimal MQTT 3.1.1 client over TLS. Posts ("status"|"serial"|"msg"|"auth", data)."""
-
-    CONNACK = {1: "protocol refused", 2: "client id refused", 3: "server unavailable",
-               4: "bad user name or access code", 5: "not authorized (wrong access code?)"}
-
-    def __init__(self, host: str, code: str, serial: str, out: queue.Queue):
-        super().__init__(daemon=True)
-        self.host, self.code, self.serial, self.out = host, code, serial, out
-        self.stop_event = threading.Event()
-        self.sock = None
-        self.online = False
-        self.outbox: queue.Queue = queue.Queue()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def publish(self, msg: dict) -> bool:
-        """Queue a request for the printer; refused while not connected, so nothing is sent late."""
-        if not self.online or self.stop_event.is_set():
-            return False
-        self.outbox.put(msg)
-        return True
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self._session()
-            except AuthError as e:
-                self.out.put(("auth", str(e)))
-                return
-            except Exception as e:  # network trouble: retry
-                if self.stop_event.is_set():
-                    break
-                self.out.put(("status", ("error", f"Connection lost: {e}. Retrying in 5 s")))
-                self.stop_event.wait(5)
-            finally:
-                self.online = False
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except OSError:
-                        pass
-                    self.sock = None
-        self.out.put(("status", ("off", "Disconnected")))
-
-    def _recv_exact(self, n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("closed by printer")
-            buf += chunk
-        return buf
-
-    def _read(self, first_timeout: float):
-        self.sock.settimeout(first_timeout)
-        try:
-            header = self._recv_exact(1)[0]
-        except (socket.timeout, TimeoutError):
-            return None
-        self.sock.settimeout(15)
-        length, mult = 0, 1
-        while True:
-            b = self._recv_exact(1)[0]
-            length += (b & 0x7F) * mult
-            mult *= 128
-            if not b & 0x80:
-                break
-        return header, self._recv_exact(length)
-
-    def _send(self, data: bytes) -> None:
-        self.sock.settimeout(15)
-        self.sock.sendall(data)
-
-    def _pushall(self, topic: str) -> None:
-        msg = {"pushing": {"sequence_id": str(int(time.time())), "command": "pushall"}}
-        self._send(_packet(0x30, _str(topic) + json.dumps(msg).encode()))
-
-    def _session(self) -> None:
-        self.out.put(("status", ("busy", f"Connecting to {self.host}…")))
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # printers use a self-signed certificate
-        raw = socket.create_connection((self.host, 8883), timeout=10)
-        self.sock = ctx.wrap_socket(raw)
-        serial = self.serial or cn_from_der(self.sock.getpeercert(binary_form=True) or b"")
-        if not serial:
-            raise AuthError("Could not read the serial number; enter it by hand")
-        self.out.put(("serial", serial))
-
-        body = _str("MQTT") + bytes([4, 0xC2]) + (60).to_bytes(2, "big")
-        body += _str(f"monitor-{os.getpid()}") + _str("bblp") + _str(self.code)
-        self._send(_packet(0x10, body))
-        pkt = self._read(10)
-        if not pkt or pkt[0] >> 4 != 2:
-            raise ConnectionError("no answer to login")
-        rc = pkt[1][1]
-        if rc:
-            raise AuthError("Login refused: " + self.CONNACK.get(rc, f"code {rc}"))
-
-        report, request = f"device/{serial}/report", f"device/{serial}/request"
-        self._send(_packet(0x82, (1).to_bytes(2, "big") + _str(report) + b"\x00"))
-        self._pushall(request)
-        self.out.put(("status", ("ok", f"Connected to {self.host}")))
-        while not self.outbox.empty():
-            self.outbox.get_nowait()
-        self.online = True
-
-        last_ping = last_push = time.time()
-        while not self.stop_event.is_set():
-            while True:
-                try:
-                    msg = self.outbox.get_nowait()
-                except queue.Empty:
-                    break
-                self._send(_packet(0x30, _str(request) + json.dumps(msg).encode()))
-            pkt = self._read(0.25)
-            now = time.time()
-            if now - last_ping > 30:
-                self._send(b"\xc0\x00")
-                last_ping = now
-            if now - last_push > 300:
-                self._pushall(request)
-                last_push = now
-            if not pkt:
-                continue
-            header, data = pkt
-            if header >> 4 == 9 and data[2:3] == b"\x80":
-                raise AuthError("Subscription refused (wrong serial number?)")
-            if header >> 4 != 3:
-                continue
-            qos = (header >> 1) & 3
-            tlen = int.from_bytes(data[:2], "big")
-            pos = 2 + tlen
-            if qos:
-                if qos == 1:
-                    self._send(b"\x40\x02" + data[pos:pos + 2])
-                pos += 2
-            try:
-                self.out.put(("msg", json.loads(data[pos:])))
-            except ValueError:
-                pass
-        try:
-            self._send(b"\xe0\x00")
-        except OSError:
-            pass
-
-
 # --------------------------------------------------------------------------- charts
 
 def nice_step(span: float, target: int) -> float:
@@ -258,7 +83,7 @@ TIME_STEPS = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800]
 class Chart:
     """Line chart on a Tk canvas: legend toggles, direct labels, hotend markers, crosshair."""
 
-    L, R, T, B = 48, 132, 30, 22
+    L, R, T, B = 48, 195, 30, 22
 
     def __init__(self, app: "App", parent, title: str, unit: str, series, fixed_max=None, step=False):
         self.app, self.title, self.unit, self.series = app, title, unit, series
@@ -307,17 +132,17 @@ class Chart:
         shown = [s for s in self.present() if s[0] not in self.hidden]
 
         # title and legend (click to show/hide)
-        c.create_text(L, 14, text=self.title, anchor="w", font=app.f_bold, fill=INK)
-        x = L + app.f_bold_m.measure(self.title) + 18
+        c.create_text(L, 14, text=tr(self.title), anchor="w", font=app.f_bold, fill=INK)
+        x = L + app.f_bold_m.measure(tr(self.title)) + 18
         for key, label, colour, tgt in self.present():
             off = key in self.hidden
             tag = "lg_" + key
             c.create_line(x, 14, x + 14, 14, fill=AXIS if off else colour, width=3, tags=tag)
-            c.create_text(x + 19, 14, text=label, anchor="w", font=app.f_small, fill=MUTED if off else INK2, tags=tag)
+            c.create_text(x + 19, 14, text=tr(label), anchor="w", font=app.f_small, fill=MUTED if off else INK2, tags=tag)
             c.tag_bind(tag, "<Button-1>", lambda e, k=key: self._toggle(k))
-            x += 19 + app.f_small_m.measure(label) + 16
+            x += 19 + app.f_small_m.measure(tr(label)) + 16
         if self.series is TEMP_SERIES:
-            c.create_text(W - 8, 14, text="dashed = target", anchor="e", font=app.f_small, fill=MUTED)
+            c.create_text(W - 8, 14, text=tr("dashed = target"), anchor="e", font=app.f_small, fill=MUTED)
 
         # y range
         vmax = 0.0
@@ -384,7 +209,7 @@ class Chart:
             for y, ly, label, colour, xe in ends:
                 lx = L + pw + 8
                 c.create_line(lx, ly, lx + 10, ly, fill=colour, width=3)
-                c.create_text(lx + 14, ly, text=label, anchor="w", font=app.f_small, fill=INK2)
+                c.create_text(lx + 14, ly, text=tr(label), anchor="w", font=app.f_small, fill=INK2)
         self.draw_hover()
 
     def _runs(self, vals, i0, i1, stride, step):
@@ -440,7 +265,7 @@ class Chart:
             v = app.vals[key][i]
             if v is None:
                 continue
-            txt = f"{label}  {v:g} {self.unit}"
+            txt = f"{tr(label)}  {v:g} {self.unit}"
             if tgt and tgt in app.vals and app.vals[tgt][i]:
                 txt += f"  (target {app.vals[tgt][i]:g})"
             rows.append((colour, txt))
@@ -478,7 +303,7 @@ class HotendStrip:
         if pw < 50 or not app.t:
             return
         t0, t1 = app.view_range()
-        c.create_text(L - 6, 11, text="Hotend", anchor="e", font=app.f_small, fill=MUTED)
+        c.create_text(L - 6, 11, text=tr("Hotend"), anchor="e", font=app.f_small, fill=MUTED)
         X = lambda t: L + (t - t0) / max(t1 - t0, 1e-9) * pw  # noqa: E731
         i0 = bisect.bisect_left(app.t, t0)
         seg_start, seg_name = None, None
@@ -490,7 +315,7 @@ class HotendStrip:
                     dark = seg_name == "Aux"
                     c.create_rectangle(xa, 3, max(xb, xa + 1), 19, fill=INK2 if dark else AXIS, outline="")
                     if xb - xa > 40:
-                        c.create_text((xa + xb) / 2, 11, text=seg_name, font=app.f_small,
+                        c.create_text((xa + xb) / 2, 11, text=tr(seg_name), font=app.f_small,
                                       fill="#ffffff" if dark else INK)
                 seg_start, seg_name = (app.t[i] if i < len(app.t) else None), name
 
@@ -530,6 +355,11 @@ class App:
         self.hms = HmsText()
         self.alerts: dict = {}          # code -> (kind, first seen)
         self.ams_sig = None
+        self.sensor_sig = None
+        self.alert_links: dict = {}
+        self.inspector = ReportInspector()
+        self.inspector_revision = -1
+        self.pending_query = None
         self.raw_fh = None
         self.raw_count = 0
         self.controls: dict = {}        # decoded by printer_control.decode_controls
@@ -537,7 +367,15 @@ class App:
         self.hold: dict = {}            # control -> time until which the report must not overwrite it
 
         self.settings = self._load_settings()
+        set_language(self.settings.get("language", "cs"))
         self._build()
+        self._text_bindings = bind_static_text(root, exclude=(self.status_lbl, self.alert_lbl, self.ctl_msg,
+            self.raw_lbl, self.switch_lbl, self.freeze_btn, self.connect_btn, self.raw_btn, self.ams_frame))
+        self._set_status("off", "Not connected")
+        self.connect_btn.configure(text=tr("Connect"))
+        self.raw_btn.configure(text=tr("Record raw…"))
+        self.freeze_btn.configure(text=tr("Freeze view"))
+        self._refresh_controls()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(200, self._drain)
         root.after(1000, self._tick)
@@ -546,14 +384,17 @@ class App:
     def _load_settings(self) -> dict:
         try:
             with open(SETTINGS, encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
 
     def _save_settings(self) -> None:
         data = {"ip": self.ip.get().strip(), "serial": self.serial.get().strip(),
                 "window": self.window.get(), "remember": bool(self.remember.get()),
-                "all_fans": bool(self.log_all_fans.get())}
+                "all_fans": bool(self.log_all_fans.get()),
+                "passive": bool(self.passive.get()), "cert_file": self.cert_file.get().strip(),
+                "model": self.model.get().strip(), "language": get_language()}
         if self.remember.get():
             data["code"] = self.code.get().strip()
         try:
@@ -569,10 +410,21 @@ class App:
         pad = {"padx": 10, "pady": 3}
         s = self.settings
 
+        language_row = ttk.Frame(r)
+        language_row.pack(fill="x", **pad)
+        ttk.Label(language_row, text="X2D Printer Monitor", font=self.f_bold).pack(side="left")
+        self.languages = available_languages()
+        self.language = tk.StringVar(value=self.languages.get(get_language(), "English"))
+        language_cb = ttk.Combobox(language_row, textvariable=self.language, values=list(self.languages.values()),
+                                   state="readonly", width=14)
+        language_cb.pack(side="right")
+        language_cb.bind("<<ComboboxSelected>>", self._change_language)
+        ttk.Label(language_row, text="Language").pack(side="right", padx=8)
+
         conn = ttk.Frame(r)
         conn.pack(fill="x", **pad)
         ttk.Label(conn, text="IP address").grid(row=0, column=0, sticky="w")
-        self.ip = tk.StringVar(value=s.get("ip", "192.168.1.207"))
+        self.ip = tk.StringVar(value=s.get("ip", ""))
         ttk.Entry(conn, textvariable=self.ip, width=16).grid(row=0, column=1, padx=(4, 14))
         ttk.Label(conn, text="Access code").grid(row=0, column=2, sticky="w")
         self.code = tk.StringVar(value=s.get("code", ""))
@@ -592,13 +444,34 @@ class App:
         ttk.Checkbutton(conn, text="Remember access code on this computer", variable=self.remember
                         ).grid(row=1, column=2, columnspan=5, sticky="w", pady=(2, 0))
         self.status_dot = tk.Canvas(conn, width=12, height=12, highlightthickness=0)
-        self.status_dot.grid(row=1, column=7, sticky="e")
+        self.status_dot.grid(row=4, column=0, sticky="w")
         self.status_lbl = ttk.Label(conn, text="Not connected")
-        self.status_lbl.grid(row=1, column=8, sticky="w", padx=(4, 0))
+        self.status_lbl.grid(row=4, column=1, columnspan=8, sticky="w", padx=(4, 0))
         self._set_status("off", "Not connected")
         for w in conn.winfo_children():
             if isinstance(w, ttk.Entry):
                 w.bind("<Return>", lambda e: self.toggle_connect())
+
+        self.discover_btn = ttk.Button(conn, text="Discover LAN…", command=self.discover)
+        self.discover_btn.grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
+        options = ttk.Frame(conn)
+        options.grid(row=2, column=0, columnspan=9, sticky="w", pady=2)
+        self.passive = tk.BooleanVar(value=s.get("passive", True))
+        ttk.Checkbutton(options, text="Passive MQTT (no commands or status requests)", variable=self.passive,
+                        command=self._refresh_controls).pack(side="left")
+        ttk.Label(options, text="Model (optional)").pack(side="left", padx=(18, 4))
+        self.model = tk.StringVar(value=s.get("model", "X2D"))
+        ttk.Entry(options, textvariable=self.model, width=12).pack(side="left")
+        trust = ttk.Frame(conn)
+        trust.grid(row=3, column=0, columnspan=9, sticky="we", pady=2)
+        ttk.Label(trust, text="Trusted certificate").pack(side="left")
+        self.cert_file = tk.StringVar(value=s.get("cert_file", ""))
+        ttk.Entry(trust, textvariable=self.cert_file, width=48).pack(side="left", padx=6)
+        ttk.Button(trust, text="Browse…", command=self._browse_certificate).pack(side="left")
+        ttk.Label(trust, text="Empty = TLS identity unverified", foreground=MUTED).pack(side="left", padx=8)
+        self.connection_widgets = [w for frame in (conn, options, trust) for w in frame.winfo_children()
+                                   if isinstance(w, (ttk.Entry, ttk.Checkbutton, ttk.Button))
+                                   and w is not self.connect_btn]
 
         ttk.Separator(r).pack(fill="x", padx=10, pady=3)
 
@@ -656,7 +529,7 @@ class App:
             step = ttk.Label(self.hot_box, text="", foreground=INK2)
             step.grid(row=row, column=4, sticky="w", padx=(6, 8))
             self.hot_rows[name] = (nz, sw, fil, step)
-        self.switch_lbl = ttk.Label(self.hot_box, text="Hotend switches: none measured yet", foreground=INK2)
+        self.switch_lbl = ttk.Label(self.hot_box, text=tr("Hotend switches: none measured yet"), foreground=INK2)
         self.switch_lbl.grid(row=2, column=0, columnspan=5, sticky="w", padx=8, pady=(4, 4))
 
         self._build_controls(r, pad)
@@ -695,7 +568,7 @@ class App:
                         ).pack(side="right")
 
         # tabs: events, switches, AMS, alerts
-        nb = ttk.Notebook(r, height=170)
+        nb = self.notebook = ttk.Notebook(r, height=170)
         nb.pack(fill="x", padx=10, pady=(0, 10))
         ev = ttk.Frame(nb)
         nb.add(ev, text="Events")
@@ -737,6 +610,72 @@ class App:
         self.al_tree.config(yscrollcommand=sb3.set)
         sb3.pack(side="right", fill="y")
         self.al_tree.pack(fill="both", expand=True, padx=4, pady=4)
+        self.al_tree.bind("<Double-1>", self._open_alert_link)
+        ttk.Label(alf, text="Double-click an HMS alert to open its Bambu Wiki page.", foreground=MUTED).pack(anchor="w", padx=8)
+
+        sensors = ttk.Frame(nb)
+        nb.add(sensors, text="Sensors")
+        self.sensor_tree = ttk.Treeview(sensors, columns=("value",), show="headings", height=7)
+        self.sensor_tree.heading("value", text="Latest received sensor state")
+        self.sensor_tree.column("value", width=1100)
+        sensor_scroll = ttk.Scrollbar(sensors, command=self.sensor_tree.yview)
+        self.sensor_tree.configure(yscrollcommand=sensor_scroll.set)
+        sensor_scroll.pack(side="right", fill="y")
+        self.sensor_tree.pack(fill="both", expand=True, padx=4, pady=4)
+        self.sensor_tree.insert("", "end", values=(tr("No sensor data received yet."),))
+
+        diagnostics = ttk.Frame(nb)
+        nb.add(diagnostics, text="Queries and calibration")
+        query_row = ttk.Frame(diagnostics)
+        query_row.pack(fill="x", padx=8, pady=4)
+        self.query_ids = list(QUERIES)
+        self.query_choice = ttk.Combobox(query_row, values=[tr(q.label) for q in QUERIES.values()],
+                                         state="readonly", width=42)
+        self.query_choice.current(0)
+        self.query_choice.pack(side="left")
+        ttk.Label(query_row, text="Nozzle mm").pack(side="left", padx=(8, 3))
+        self.query_nozzle = ttk.Combobox(query_row, values=("0.2", "0.4", "0.6", "0.8"), width=4, state="readonly")
+        self.query_nozzle.set("0.4")
+        self.query_nozzle.pack(side="left")
+        ttk.Label(query_row, text="Extruder id").pack(side="left", padx=(8, 3))
+        self.query_extruder = ttk.Combobox(query_row, values=("1", "0"), width=3, state="readonly")
+        self.query_extruder.set("1")
+        self.query_extruder.pack(side="left")
+        self.query_btn = ttk.Button(query_row, text="Send read query", command=self._send_query)
+        self.query_btn.pack(side="left", padx=8)
+        self.experimental_queries = tk.BooleanVar(value=False)
+        ttk.Checkbutton(diagnostics, text="Enable experimental calibration reads (firmware-dependent)",
+                        variable=self.experimental_queries).pack(anchor="w", padx=8)
+        ttk.Label(diagnostics, text="X2D: Studio declares support_extrusion_cali=false. Bed mesh and vibration coefficients: no verified LAN read command.",
+                  wraplength=1100, foreground=INK2).pack(anchor="w", padx=8, pady=3)
+        self.query_status = ttk.Label(diagnostics, text="Active MQTT is required. Query responses appear in the Inspector.", wraplength=1100)
+        self.query_status.pack(anchor="w", padx=8, pady=4)
+
+        inspector = ttk.Frame(nb)
+        nb.add(inspector, text="Inspector")
+        search_row = ttk.Frame(inspector)
+        search_row.pack(fill="x", padx=6, pady=3)
+        ttk.Label(search_row, text="Filter fields").pack(side="left")
+        self.field_filter = tk.StringVar()
+        ttk.Entry(search_row, textvariable=self.field_filter, width=35).pack(side="left", padx=6)
+        self.field_filter.trace_add("write", lambda *args: self._update_inspector(force=True))
+        ttk.Button(search_row, text="Export observed JSON…", command=self._export_inspector).pack(side="left", padx=4)
+        self.field_count = ttk.Label(search_row, text="")
+        self.field_count.pack(side="left", padx=6)
+        columns = ("path", "value", "previous", "changes", "seen", "hint")
+        self.field_tree = ttk.Treeview(inspector, columns=columns, show="headings", height=5)
+        for column, width, label in (("path", 340, "JSON path"), ("value", 150, "Raw value"),
+                ("previous", 120, "Previous value"), ("changes", 60, "Changes"),
+                ("seen", 85, "Received"), ("hint", 380, "Interpretation / source")):
+            self.field_tree.heading(column, text=label)
+            self.field_tree.column(column, width=width, minwidth=50, stretch=(column in ("path", "hint")))
+        field_scroll = ttk.Scrollbar(inspector, command=self.field_tree.yview)
+        field_scroll.pack(side="right", fill="y")
+        horizontal = ttk.Scrollbar(inspector, orient="horizontal", command=self.field_tree.xview)
+        horizontal.pack(side="bottom", fill="x")
+        self.field_tree.configure(yscrollcommand=field_scroll.set, xscrollcommand=horizontal.set)
+        self.field_tree.pack(fill="both", expand=True)
+        nb.bind("<<NotebookTabChanged>>", lambda event: self._update_inspector(force=True))
 
     # ---- controls
     def _build_controls(self, r, pad) -> None:
@@ -745,10 +684,11 @@ class App:
         row = ttk.Frame(box)
         row.pack(fill="x", padx=8, pady=(4, 2))
         self.ctl_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="Enable controls", variable=self.ctl_on,
-                        command=self._refresh_controls).pack(side="left")
-        self.pause_btn = ttk.Button(row, text="Pause", width=7, command=lambda: self._send(pc.pause()))
-        self.resume_btn = ttk.Button(row, text="Resume", width=7, command=lambda: self._send(pc.resume()))
+        self.controls_chk = ttk.Checkbutton(row, text="Enable controls", variable=self.ctl_on,
+                                            command=self._refresh_controls)
+        self.controls_chk.pack(side="left")
+        self.pause_btn = ttk.Button(row, text="Pause", width=11, command=lambda: self._send(pc.pause()))
+        self.resume_btn = ttk.Button(row, text="Resume", width=11, command=lambda: self._send(pc.resume()))
         self.stop_btn = ttk.Button(row, text="Stop…", width=7, command=self._stop_print)
         self.pause_btn.pack(side="left", padx=(16, 2))
         self.resume_btn.pack(side="left", padx=2)
@@ -783,7 +723,7 @@ class App:
             ent = ttk.Entry(row2, textvariable=var, width=5, justify="right")
             ent.pack(side="left")
             ent.bind("<Return>", lambda e, k=key: self._set_temp(k))
-            btn = ttk.Button(row2, text="Set", width=4, command=lambda k=key: self._set_temp(k))
+            btn = ttk.Button(row2, text="Set", width=6, command=lambda k=key: self._set_temp(k))
             btn.pack(side="left", padx=(3, 0))
             self.temp_entries[key] = (var, ent, btn)
         self.ctl_msg = ttk.Label(row2, text="", foreground=INK2)
@@ -791,12 +731,19 @@ class App:
         self._refresh_controls()
 
     def _controls_live(self) -> bool:
-        return bool(self.ctl_on.get() and self.link and self.link.online and self.state.get("print")
+        return bool(self.ctl_on.get() and self.link and not self.link.passive and self.link.online and self.state.get("print")
                     and time.time() - self.last_msg < 60)
 
     def _refresh_controls(self) -> None:
         """Enable what the printer can do now and show its current light, speed and air duct mode."""
         live = self._controls_live()
+        passive = self.link.passive if self.link else self.passive.get()
+        self.controls_chk.configure(state="disabled" if passive else "normal")
+        if passive:
+            self.ctl_on.set(False)
+        if hasattr(self, "query_btn"):
+            self.query_btn.configure(state="normal" if self.link and self.link.online and not passive
+                                     and self.pending_query is None else "disabled")
         c = self.controls = pc.decode_controls(self.state.get("print") or {})
         now = time.time()
 
@@ -835,17 +782,19 @@ class App:
         if now > self.hold.get("duct", 0):
             self.duct_var.set(pc.airduct_name(c["duct_mode"]) if c["duct_mode"] in c["duct_modes"] else "")
         if now > self.hold.get("msg", 0):
-            if not self.ctl_on.get():
+            if passive:
+                hint = "Passive MQTT. To use controls, disconnect and turn off Passive MQTT."
+            elif not self.ctl_on.get():
                 hint = "Tick “Enable controls” to send commands (printer in Developer Mode)."
             elif not live:
                 hint = "Connect to the printer to use the controls."
             else:
                 lim = c["limits"]
                 hint = f"Limits: hotend {lim['nozzle']}, bed {lim['bed']}, chamber {lim['chamber']} °C."
-            self.ctl_msg.config(text=hint, foreground=INK2)
+            self.ctl_msg.config(text=tr(hint), foreground=INK2)
 
     def _note(self, text, error=False) -> None:
-        self.ctl_msg.config(text=text, foreground=STATUS["error"] if error else INK)
+        self.ctl_msg.config(text=tr(text), foreground=STATUS["error"] if error else INK)
         self.hold["msg"] = time.time() + 8
 
     def _send(self, msgs, hold=None) -> bool:
@@ -872,7 +821,7 @@ class App:
 
     def _is_reply(self, data) -> bool:
         """True for the printer's answer to a command (anything but a status push); logs our own."""
-        for section in ("print", "system"):
+        for section in ("print", "system", "info", "pushing", "camera"):
             body = data.get(section)
             if not isinstance(body, dict) or "command" not in body or body["command"] == "push_status":
                 continue
@@ -959,9 +908,10 @@ class App:
         self.value_labels[key] = v
 
     def _set_status(self, kind, text):
+        self._status = (kind, text)
         self.status_dot.delete("all")
         self.status_dot.create_oval(1, 1, 11, 11, fill=STATUS[kind], outline="")
-        self.status_lbl.config(text=text)
+        self.status_lbl.config(text=tr(text))
 
     def _set_alert_dot(self, kind):
         self.alert_dot.delete("all")
@@ -974,11 +924,90 @@ class App:
         self.events.config(state="disabled")
 
     # ---- connection
+    def _change_language(self, event=None):
+        code = next((key for key, value in self.languages.items() if value == self.language.get()), "en")
+        selection = self.query_choice.current()
+        set_language(code)
+        for apply in self._text_bindings:
+            apply()
+        self.query_choice.configure(values=[tr(q.label) for q in QUERIES.values()])
+        self.query_choice.current(max(0, selection))
+        self.connect_btn.configure(text=tr("Disconnect" if self.link else "Connect"))
+        self.raw_btn.configure(text=tr("Stop recording" if self.raw_fh else "Record raw…"))
+        self.freeze_btn.configure(text=tr("Follow live" if self.frozen_at else "Freeze view"))
+        self._set_status(*self._status)
+        self.hms.load(self.serial.get().strip(), lang=code, model=self.model.get().strip() or None)
+        for iid in self.al_tree.get_children():
+            values = list(self.al_tree.item(iid, "values"))
+            raw_code = values[2].replace("_", "")
+            if values[1] == "Error":
+                values[3] = self.hms.error_text(raw_code) or values[3]
+            elif values[1] == "HMS":
+                values[3] = self.hms.hms_text(raw_code) or values[3]
+            self.al_tree.item(iid, values=values)
+        self._refresh_controls()
+        self._update_values(decode(self.state.get("print") or {}), self.extras)
+        self._update_inspector(force=True)
+        self.redraw()
+        self._save_settings()
+
+    def _browse_certificate(self):
+        path = filedialog.askopenfilename(filetypes=[("PEM certificate", "*.pem"), ("All files", "*")])
+        if path:
+            self.cert_file.set(path)
+
+    def discover(self):
+        if not self.link:
+            DiscoveryDialog(self.root, self._select_printer)
+
+    def _select_printer(self, candidate, cert_file):
+        self.ip.set(str(candidate.ip))
+        self.serial.set(candidate.serial or (candidate.certificate.common_name if candidate.certificate else "") or "")
+        model = candidate.model or ""
+        self.model.set(lan.SSDP_MODEL_ALIASES.get(model.upper(), model))
+        # Never reuse a different printer's saved trust when changing devices.
+        self.cert_file.set(cert_file)
+
+    def _connection_editable(self, editable):
+        for widget in self.connection_widgets:
+            widget.configure(state="normal" if editable else "disabled")
+
+    def _reset_session(self):
+        """Keep histories for one printer only, without stale alerts or switch timing."""
+        self.state, self.extras = {}, {}
+        self.prev, self.prev_x = None, {}
+        self.timer = SwitchTimer()
+        self.last_msg, self.msg_times = 0.0, []
+        self.alerts.clear()
+        self.alert_links.clear()
+        self.sent.clear()
+        self.inspector = ReportInspector()
+        self.inspector_revision = -1
+        self.pending_query = None
+        self.hold.clear()
+        self.ams_sig = self.sensor_sig = None
+        self.ctl_on.set(False)
+        self.clear()
+        for iid in self.al_tree.get_children():
+            self.al_tree.delete(iid)
+        self._alerts({})
+        self._update_values(decode({}), {})
+        self._update_ams({})
+        self._update_sensors()
+        for key, widget in self.value_labels.items():
+            widget.configure(text="—")
+
     def toggle_connect(self):
         if self.link:
             self.link.stop()
             self.link = None
-            self.connect_btn.config(text="Connect")
+            self.q = queue.Queue()  # isolate late messages from the stopped worker
+            self.pending_query = None
+            self.ctl_on.set(False)
+            self.connect_btn.config(text=tr("Connect"))
+            self._connection_editable(True)
+            self._set_status("off", "Disconnected")
+            self._refresh_controls()
             return
         ip, code = self.ip.get().strip(), self.code.get().strip()
         if ip.startswith("http"):
@@ -987,12 +1016,22 @@ class App:
         if not ip or not code:
             messagebox.showwarning(APP_TITLE, "Enter the printer's IP address and LAN access code.")
             return
-        self.state = {}
-        if self.serial.get().strip():
-            self.hms.load(self.serial.get().strip())
-        self.link = PrinterLink(ip, code, self.serial.get().strip(), self.q)
+        serial = self.serial.get().strip()
+        try:
+            if serial:
+                lan.validate_serial(serial)
+        except lan.BambuMonitorError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        self._reset_session()
+        self.hms.load(serial, lang=get_language(), model=self.model.get().strip() or None)
+        self.q = queue.Queue()
+        self.link = PrinterLink(ip, code, serial, self.q, passive=self.passive.get(),
+                                cert_file=self.cert_file.get().strip() or None)
         self.link.start()
-        self.connect_btn.config(text="Disconnect")
+        self.connect_btn.config(text=tr("Disconnect"))
+        self._connection_editable(False)
+        self._refresh_controls()
         self._save_settings()
 
     def _drain(self):
@@ -1001,6 +1040,8 @@ class App:
                 kind, data = self.q.get_nowait()
                 if kind == "msg":
                     now = time.time()
+                    self.inspector.observe(data, now)
+                    self._query_response(data)
                     if self._is_reply(data):   # answer to a command: not part of the status
                         if self.raw_fh:
                             self.raw_fh.write(json.dumps({"t": round(now, 3), "msg": data}) + "\n")
@@ -1016,15 +1057,18 @@ class App:
                 elif kind == "serial":
                     if not self.serial.get().strip():
                         self.serial.set(data)
-                    if not self.hms.hms:
-                        self.hms.load(data)
+                    self.hms.load(data, lang=get_language(), model=self.model.get().strip() or None)
                 elif kind == "status":
+                    if data[0] != "ok":
+                        self.last_msg = 0.0  # require a fresh report after reconnect
                     self._set_status(*data)
                     self._refresh_controls()
-                elif kind == "auth":
+                elif kind in ("auth", "fatal"):
                     self._set_status("error", data)
                     self.link = None
-                    self.connect_btn.config(text="Connect")
+                    self.connect_btn.config(text=tr("Connect"))
+                    self._connection_editable(True)
+                    self._refresh_controls()
         except queue.Empty:
             pass
         self.root.after(200, self._drain)
@@ -1053,6 +1097,10 @@ class App:
     def _tick(self):
         self.root.after(1000, self._tick)
         self._refresh_controls()
+        self._update_inspector()
+        if self.pending_query and time.monotonic() - self.pending_query[2] > 15:
+            self.query_status.configure(text=tr("No matching response within 15 s. The firmware may not support this query; missing data is not zero."))
+            self.pending_query = None
         if self.raw_fh:
             self.raw_fh.flush()
             self.raw_lbl.config(text=f"recording: {self.raw_count} messages")
@@ -1086,6 +1134,7 @@ class App:
         self._alerts(x)
         self._update_values(d, x)
         self._update_ams(x)
+        self._update_sensors()
         self.redraw()
 
     def _events(self, d, x):
@@ -1118,17 +1167,23 @@ class App:
     def _alerts(self, x):
         current = {}
         for code in x.get("hms") or []:
-            current[code] = "HMS"
+            formatted = "HMS_" + "_".join(code[i:i + 4] for i in range(0, len(code), 4))
+            current[code] = "Status" if formatted in lan.KNOWN_NORMAL_HMS_NOTES else "HMS"
         if x.get("print_error"):
             current[x["print_error"]] = "Error"
         for code, kind in current.items():
             if code not in self.alerts:
-                text = self.hms.hms_text(code) if kind == "HMS" else self.hms.error_text(code)
+                text = self.hms.error_text(code) if kind == "Error" else self.hms.hms_text(code)
+                if kind == "Status":
+                    formatted = "HMS_" + "_".join(code[i:i + 4] for i in range(0, len(code), 4))
+                    text = tr(lan.KNOWN_NORMAL_HMS_NOTES[formatted])
                 shown = "_".join(code[i:i + 4] for i in range(0, len(code), 4))
                 iid = self.al_tree.insert("", "end", values=(f"{datetime.now():%H:%M:%S}", kind, shown,
-                                                             text or "(no text in Bambu Studio's HMS file)"))
+                                                             text or "(unknown code; check the printer display)"))
+                if kind != "Error":
+                    self.alert_links[iid] = self.hms.wiki_url(code)
                 self.alerts[code] = (kind, iid, text)
-                self._log(f"{kind} {shown}: {text or 'unknown code'}", "alert")
+                self._log(f"{kind} {shown}: {text or 'unknown code'}", "alert" if kind != "Status" else None)
         for code in [c for c in self.alerts if c not in current]:
             kind, iid, text = self.alerts.pop(code)
             self.al_tree.item(iid, tags=("cleared",))
@@ -1136,42 +1191,134 @@ class App:
             vals[0] = f"{vals[0]}–{datetime.now():%H:%M:%S}"
             self.al_tree.item(iid, values=vals)
             self._log(f"{kind} {code} cleared")
-        if self.alerts:
-            first = next(iter(self.alerts.values()))
-            n = len(self.alerts)
-            self._set_alert_dot("error" if any(v[0] == "Error" for v in self.alerts.values()) else "busy")
-            self.alert_lbl.config(text=f"{n} alert{'s' if n > 1 else ''}: {first[2] or 'see the Alerts tab'}"[:160],
+        faults = [v for v in self.alerts.values() if v[0] != "Status"]
+        if faults:
+            first = faults[0]
+            n = len(faults)
+            self._set_alert_dot("error" if any(v[0] == "Error" for v in faults) else "busy")
+            self.alert_lbl.config(text=tr("Alerts: {count}. {message}", count=n, message=first[2] or tr("See the Alerts tab"))[:160],
                                   foreground=INK)
         else:
             self._set_alert_dot(None)
-            self.alert_lbl.config(text="No alerts", foreground=INK2)
+            self.alert_lbl.config(text=tr("No alerts"), foreground=INK2)
+
+    def _open_alert_link(self, event):
+        iid = self.al_tree.identify_row(event.y)
+        url = self.alert_links.get(iid)
+        if url and url.startswith("https://wiki.bambulab.com/"):
+            webbrowser.open(url)
+
+    def _update_sensors(self):
+        summary = lan.sensor_summary(self.state)
+        hotends = self.extras.get("hotends") or {}
+        signature = (summary, json.dumps(hotends, sort_keys=True), get_language())
+        if signature == self.sensor_sig:
+            return
+        self.sensor_sig = signature
+        self.sensor_tree.delete(*self.sensor_tree.get_children())
+        for description in summary.split(" | ") if summary else ["No sensor data received yet."]:
+            self.sensor_tree.insert("", "end", values=(tr(description),))
+        for name, hotend in hotends.items():
+            if "has_filament" in hotend:
+                description = tr("{hotend}: filament {filament}, buffer {buffer}, nozzle {nozzle}",
+                    hotend=tr(name), filament=tr("present" if hotend["has_filament"] else "absent"),
+                    buffer=tr("present" if hotend["buffer_filament"] else "absent"),
+                    nozzle=tr("present" if hotend["has_nozzle"] else "absent"))
+                self.sensor_tree.insert("", "end", values=(description,))
+
+    def _send_query(self):
+        if not self.link or not self.link.online or self.link.passive or self.pending_query:
+            return
+        name = self.query_ids[self.query_choice.current()]
+        query = QUERIES[name]
+        if query.experimental and not self.experimental_queries.get():
+            self.query_status.configure(text=tr("Enable experimental calibration reads first. Support on X2D is unverified."))
+            return
+        try:
+            message = build_query(name, self.query_nozzle.get(), int(self.query_extruder.get()))
+        except ValueError as exc:
+            self.query_status.configure(text=str(exc))
+            return
+        if self.link.publish(message):
+            sequence = message[query.section]["sequence_id"]
+            self.pending_query = (name, sequence, time.monotonic())
+            self.query_status.configure(text=tr("Read query sent: {command}. Waiting for a response…", command=query.command))
+            self._log(tr("Read query sent: {command}", command=query.command), "sent")
+            self._refresh_controls()
+
+    def _query_response(self, data):
+        if self.pending_query is None:
+            return
+        name, sequence, _ = self.pending_query
+        query = QUERIES[name]
+        for section, body in data.items():
+            if not isinstance(body, dict):
+                continue
+            if name == "status" and section == "print" and body.get("command") == "push_status":
+                self.query_status.configure(text=tr("A status report arrived after the request (pushall has no guaranteed response correlation)."))
+                self.pending_query = None
+                return
+            if section == query.section and body.get("command") == query.command and str(body.get("sequence_id")) == sequence:
+                result = body.get("result", "response received")
+                self.query_status.configure(text=tr("Response to {command}: {result}. Raw fields are in the Inspector.", command=query.command, result=result))
+                self.pending_query = None
+                return
+
+    def _update_inspector(self, force=False):
+        if not hasattr(self, "field_tree"):
+            return
+        if not force and self.inspector_revision == self.inspector.revision:
+            return
+        if not force and self.notebook.select() != str(self.field_tree.master):
+            return
+        self.inspector_revision = self.inspector.revision
+        self.field_tree.delete(*self.field_tree.get_children())
+        search = self.field_filter.get().casefold().strip()
+        fields = [(path, field) for path, field in sorted(self.inspector.fields.items())
+                  if not search or search in path.casefold() or search in str(field.value).casefold()]
+        for path, field in fields[:2000]:
+            value = json.dumps(field.value, ensure_ascii=False)
+            previous = json.dumps(field.previous, ensure_ascii=False) if field.changes else ""
+            self.field_tree.insert("", "end", values=(path, value[:500], previous[:200], field.changes,
+                datetime.fromtimestamp(field.seen).strftime("%H:%M:%S"), tr(self.inspector.hint(path))))
+        self.field_count.configure(text=tr("{shown} / {total} fields", shown=min(2000, len(fields)), total=len(fields)))
+
+    def _export_inspector(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")],
+                                           initialfile=f"printer-observed-{datetime.now():%Y%m%d-%H%M}.json")
+        if path:
+            try:
+                self.inspector.export(path)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror(tr("Export failed"), str(exc))
 
     def _update_values(self, d, x):
         st = d.get("state", "?")
-        self.state_lbl.config(text=STATE_TEXT.get(st, st))
+        self.state_lbl.config(text=tr(STATE_TEXT.get(st, st)))
         pct = d.get("percent")
         self.progress["value"] = pct or 0
         parts = []
         if pct is not None:
             parts.append(f"{pct}%")
         if d.get("layers"):
-            parts.append(f"layer {d.get('layer')}/{d.get('layers')}")
+            parts.append(tr("layer {current}/{total}", current=d.get('layer'), total=d.get('layers')))
         if d.get("remain_min") not in (None, 0):
             m = int(d["remain_min"])
-            parts.append(f"{m // 60} h {m % 60:02d} min left" if m >= 60 else f"{m} min left")
+            parts.append(tr("{hours} h {minutes:02d} min left", hours=m // 60, minutes=m % 60)
+                         if m >= 60 else tr("{minutes} min left", minutes=m))
         self.progress_lbl.config(text="  ·  ".join(parts))
         hot = d.get("active")
-        txt = f"Active hotend: {hot}" if isinstance(hot, str) else ""
+        txt = tr("Active hotend: {hotend}", hotend=tr(hot)) if isinstance(hot, str) else ""
         if d.get("switching"):
             txt += f" → {d.get('target_hotend')} ({SWITCH_STATES.get(d.get('switching'), 'busy')})"
         self.hotend_lbl.config(text=txt)
-        self.stage_lbl.config(text=f"Stage: {x['stage']}" if x.get("stage") else "")
+        self.stage_lbl.config(text=tr("Stage: {stage}", stage=tr(x["stage"])) if x.get("stage") else "")
         sp = ""
         if x.get("speed"):
-            sp = f"Speed: {x['speed']}" + (f" ({x['speed_pct']}%)" if x.get("speed_pct") else "")
+            sp = tr("Speed: {speed}", speed=tr(x["speed"])) + (f" ({x['speed_pct']}%)" if x.get("speed_pct") else "")
         if len(self.msg_times) > 5:
             span = self.msg_times[-1] - self.msg_times[0]
-            sp += f"   ·   reports every {span / (len(self.msg_times) - 1):.1f} s"
+            sp += "   ·   " + tr("reports every {seconds:.1f} s", seconds=span / (len(self.msg_times) - 1))
         self.speed_lbl.config(text=sp)
         self.file_lbl.config(text=d.get("file") or "")
         for key, label, colour, tgt in TEMP_SERIES:
@@ -1181,7 +1328,7 @@ class App:
             key = "fan_" + name
             if key not in self.value_labels:
                 colour = SLOTS[FAN_ORDER.index(name)]
-                self._value_row(self.fan_box, key, name, colour, n % 4, (n // 4) * 3)
+                self._value_row(self.fan_box, key, tr(name), colour, n % 4, (n // 4) * 3)
             self.value_labels[key].config(text=f"{d['fans'][name]} %")
 
         hot = x.get("hotends") or {}
@@ -1194,12 +1341,14 @@ class App:
                                           f"{f['remain']}%" if isinstance(f.get("remain"), int) and f["remain"] >= 0 else "") if p)
             if ftxt and h.get("in_extruder") is False:
                 ftxt += "  (this print; not in the extruder now)"
-            fil.config(text=ftxt or ("nothing loaded" if h else ""), foreground=INK2 if h.get("in_extruder") is False else INK)
+            fil.config(text=ftxt or (tr("nothing loaded") if h else ""), foreground=INK2 if h.get("in_extruder") is False else INK)
             st_txt = h.get("step") if h.get("step") not in (None, "idle") else ""
             if name == hot_name_active(d):
-                st_txt = ("active" + (f", {st_txt}" if st_txt else ""))
+                st_txt = (tr("active") + (f", {tr(st_txt)}" if st_txt else ""))
             step.config(text=st_txt)
         stats = self.timer.stats()
+        if not stats:
+            self.switch_lbl.configure(text=tr("Hotend switches: none measured yet"))
         if stats:
             txt = f"Hotend switches: {stats['count']}"
             if stats.get("timed"):
@@ -1279,7 +1428,7 @@ class App:
 
     def toggle_freeze(self):
         self.frozen_at = None if self.frozen_at else (self.t[-1] if self.t else time.time())
-        self.freeze_btn.config(text="Follow live" if self.frozen_at else "Freeze view")
+        self.freeze_btn.config(text=tr("Follow live" if self.frozen_at else "Freeze view"))
         self.redraw()
 
     def clear(self):
@@ -1287,14 +1436,14 @@ class App:
         self.timer.records = []
         for iid in self.sw_tree.get_children():
             self.sw_tree.delete(iid)
-        self.switch_lbl.config(text="Hotend switches: none measured yet", foreground=INK2)
+        self.switch_lbl.config(text=tr("Hotend switches: none measured yet"), foreground=INK2)
         self.redraw()
 
     def toggle_raw(self):
         if self.raw_fh:
             self.raw_fh.close()
             self.raw_fh = None
-            self.raw_btn.config(text="Record raw…")
+            self.raw_btn.config(text=tr("Record raw…"))
             self.raw_lbl.config(text=f"saved {self.raw_count} messages")
             return
         path = filedialog.asksaveasfilename(defaultextension=".jsonl", filetypes=[("JSON lines", "*.jsonl")],
@@ -1305,7 +1454,7 @@ class App:
         self.raw_count = 0
         if self.state:  # start with the full merged state so the file is usable on its own
             self.raw_fh.write(json.dumps({"t": round(time.time(), 3), "merged_state": self.state}) + "\n")
-        self.raw_btn.config(text="Stop recording")
+        self.raw_btn.config(text=tr("Stop recording"))
 
     def save_csv(self):
         if not self.t:

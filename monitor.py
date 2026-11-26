@@ -24,16 +24,19 @@ The access code is read from BAMBU_ACCESS_CODE or asked for (not echoed).
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import getpass
 import json
+import math
 import os
-import ssl
 import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
+
+from bambu_monitor import create_ssl_context, fan_percentage
+from printer_state import deep_merge
 
 # AIR_FUN ids (DevFan.h) -> labels used by Bambu Studio's fan popup
 FAN_NAMES = {
@@ -62,34 +65,9 @@ def bits(value: int, start: int, count: int = 1) -> int:
     return (int(value) >> start) & ((1 << count) - 1)
 
 
-def deep_merge(dst: dict, src: dict) -> None:
-    """Reports may be partial; keep the latest value of every key."""
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            deep_merge(dst[k], v)
-        elif _id_list(v) and _id_list(dst.get(k)):
-            # fan parts, hotend info: update entries by "id", keep the others
-            by_id = {e["id"]: e for e in dst[k]}
-            for e in v:
-                if e["id"] in by_id:
-                    deep_merge(by_id[e["id"]], e)
-                else:
-                    dst[k].append(copy.deepcopy(e))
-        else:
-            dst[k] = copy.deepcopy(v)
-
-
-def _id_list(v) -> bool:
-    return isinstance(v, list) and bool(v) and all(isinstance(e, dict) and "id" in e for e in v)
-
-
 def legacy_fan_percent(raw) -> int | None:
-    """Old 0..15 string fields, converted like DevFan::ParseV1_0 + FanControl."""
-    try:
-        v = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return int(v // 1.5) * 10
+    """Legacy PWM conversion shared with the passive LAN monitor."""
+    return fan_percentage(raw)
 
 
 def decode(p: dict) -> dict:
@@ -120,12 +98,15 @@ def decode(p: dict) -> dict:
             out[f"T_{name}_tgt"] = bits(e["temp"], 16, 16)
         if "hnow" in e:
             out[f"nozzle_{name}"] = e["hnow"]
-    if not ext and "nozzle_temper" in p:
+    if not any(k in out for k in ("T_Main", "T_Aux")) and "nozzle_temper" in p:
         out["T_Main"] = p.get("nozzle_temper")
         out["T_Main_tgt"] = p.get("nozzle_target_temper")
 
     # bed and chamber
-    if "bed_temp" in dev:
+    bed_info = (dev.get("bed") or {}).get("info") or {}
+    if "temp" in bed_info:
+        out["T_bed"], out["T_bed_tgt"] = bits(bed_info["temp"], 0, 16), bits(bed_info["temp"], 16, 16)
+    elif "bed_temp" in dev:
         out["T_bed"], out["T_bed_tgt"] = bits(dev["bed_temp"], 0, 16), bits(dev["bed_temp"], 16, 16)
     elif "bed_temper" in p:
         out["T_bed"], out["T_bed_tgt"] = p.get("bed_temper"), p.get("bed_target_temper")
@@ -134,6 +115,7 @@ def decode(p: dict) -> dict:
         out["T_chamber"], out["T_chamber_tgt"] = bits(ctc["temp"], 0, 16), bits(ctc["temp"], 16, 16)
     elif "chamber_temper" in p:
         out["T_chamber"] = p.get("chamber_temper")
+        out["T_chamber_tgt"] = p.get("chamber_target_temper")
 
     # fans: new airduct block first, legacy fields as fallback
     fans: dict = {}
@@ -146,12 +128,11 @@ def decode(p: dict) -> dict:
                 continue
             fid = bits(part["id"], 4, 8)
             fans[FAN_NAMES.get(fid, f"fan{fid}")] = bits(part.get("state", 0), 0, 8)
-    if not fans:
-        for key, name in (("cooling_fan_speed", "Parts"), ("big_fan1_speed", "Aux left"),
-                          ("big_fan2_speed", "Exhaust")):
-            v = legacy_fan_percent(p.get(key))
-            if v is not None:
-                fans[name] = v
+    for key, name in (("cooling_fan_speed", "Parts"), ("big_fan1_speed", "Aux left"),
+                      ("big_fan2_speed", "Exhaust")):
+        v = legacy_fan_percent(p.get(key))
+        if v is not None and name not in fans:
+            fans[name] = v
     if "heatbreak_fan_speed" in p and "Hotend" not in fans:
         fans["Hotend"] = legacy_fan_percent(p["heatbreak_fan_speed"])
     out["fans"] = fans
@@ -186,10 +167,16 @@ def main() -> int:
     ap.add_argument("--code", help="LAN access code (default: $BAMBU_ACCESS_CODE or prompt)")
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between status lines")
     ap.add_argument("--pushall", type=float, default=300, help="seconds between full-status requests")
+    ap.add_argument("--passive", action="store_true", help="subscribe only: never send status requests")
+    ap.add_argument("--cert-file", type=Path, help="PEM certificate to trust for TLS verification")
     ap.add_argument("--csv", help="append one row per interval to this CSV file")
     ap.add_argument("--raw", help="append every received report as JSON lines to this file")
     ap.add_argument("--quiet", action="store_true", help="print only events, not the status line")
     args = ap.parse_args()
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        ap.error("--interval must be a finite positive number")
+    if not math.isfinite(args.pushall) or args.pushall < 0:
+        ap.error("--pushall must be finite and non-negative (0 disables requests)")
 
     try:  # imported here so printer_gui.py can reuse decode() without paho
         import paho.mqtt.client as mqtt
@@ -206,6 +193,8 @@ def main() -> int:
     raw_fh = open(args.raw, "a", encoding="utf-8") if args.raw else None
 
     def request_pushall(client) -> None:
+        if args.passive or args.pushall == 0:
+            return
         client.publish(request_topic, json.dumps(
             {"pushing": {"sequence_id": str(int(time.time())), "command": "pushall"}}))
 
@@ -220,9 +209,13 @@ def main() -> int:
         request_pushall(client)
 
     def on_message(client, userdata, msg):
+        if msg.topic != report_topic:
+            return
         try:
             payload = json.loads(msg.payload)
-        except ValueError:
+        except (ValueError, UnicodeError):
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("print", {}), dict):
             return
         if raw_fh:
             raw_fh.write(json.dumps({"t": time.time(), "msg": payload}) + "\n")
@@ -237,9 +230,8 @@ def main() -> int:
     else:
         client = mqtt.Client(client_id=f"monitor-{os.getpid()}")
     client.username_pw_set("bblp", code)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # printer uses a self-signed certificate
+    ctx = create_ssl_context(args.cert_file)
+    print("TLS: trusted certificate" if args.cert_file else "TLS: identity unverified (CERT_NONE)", file=sys.stderr)
     client.tls_set_context(ctx)
     client.on_connect = on_connect
     client.on_message = on_message
@@ -249,6 +241,9 @@ def main() -> int:
     if not got_data.wait(15):
         print("no status received within 15 s", file=sys.stderr)
         client.loop_stop()
+        client.disconnect()
+        if raw_fh:
+            raw_fh.close()
         return 1
 
     csv_fh = csv_writer = None

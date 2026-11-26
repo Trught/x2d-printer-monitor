@@ -17,6 +17,9 @@ import json
 import os
 import sys
 
+from bambu_monitor import ErrorCatalog
+from i18n import tr
+
 from monitor import bits, hotend_name
 
 STAGES = {
@@ -148,6 +151,10 @@ def decode_extras(p: dict) -> dict:
         eid = e.get("id")
         name = hotend_name(eid, total)
         h: dict = {"id": eid}
+        flags = _int(e.get("info"))
+        if flags is not None:
+            h.update(has_filament=bool(bits(flags, 1)), buffer_filament=bool(bits(flags, 2)),
+                     has_nozzle=bool(bits(flags, 3)))
         nid = e.get("hnow", eid)
         if nid in nozzles:
             h["nozzle"] = nozzle_text(nozzles[nid])
@@ -263,36 +270,62 @@ def bambu_data_dirs() -> list:
 
 
 class HmsText:
-    """Looks up HMS and print-error codes in Bambu Studio's downloaded HMS files."""
+    """Prefer local Studio messages; fall back to the bundled model-aware catalog."""
 
     def __init__(self):
         self.hms: dict = {}
         self.err: dict = {}
         self.loaded_from = None
+        self.catalog = ErrorCatalog()
+        self._loaded_key = None
 
-    def load(self, serial: str, lang: str = "en") -> None:
+    def load(self, serial: str, lang: str = "en", model: str | None = None) -> None:
+        key = ((serial or "")[:3], lang, model)
+        if self._loaded_key == key:
+            return
+        self._loaded_key = key
+        self.hms.clear()
+        self.err.clear()
+        self.loaded_from = None
+        self.catalog.device_model = self.catalog_alias(model)
         prefix = (serial or "")[:3]
-        for d in bambu_data_dirs():
-            for name in (f"hms_{lang}_{prefix}.json", f"hms_{lang}.json"):
-                path = os.path.join(d, "hms", name)
-                try:
-                    with open(path, encoding="utf-8") as fh:
-                        data = json.load(fh).get("data", {})
-                except (OSError, ValueError, AttributeError):
-                    continue
-                for key, target in (("device_hms", self.hms), ("device_error", self.err)):
-                    for item in (data.get(key) or {}).get(lang) or []:
-                        code = str(item.get("ecode", "")).upper()
-                        if code and code not in target:
-                            target[code] = item.get("intro", "")
-                self.loaded_from = self.loaded_from or path
+        for requested_lang in dict.fromkeys((lang, "en")):
+            for d in bambu_data_dirs():
+                for name in (f"hms_{requested_lang}_{prefix}.json", f"hms_{requested_lang}.json"):
+                    path = os.path.join(d, "hms", name)
+                    try:
+                        with open(path, encoding="utf-8") as fh:
+                            data = json.load(fh).get("data", {})
+                        if not isinstance(data, dict):
+                            continue
+                    except (OSError, ValueError, AttributeError):
+                        continue
+                    for key, target in (("device_hms", self.hms), ("device_error", self.err)):
+                        entries = data.get(key)
+                        entries = entries.get(requested_lang, []) if isinstance(entries, dict) else []
+                        for item in entries if isinstance(entries, list) else []:
+                            if not isinstance(item, dict):
+                                continue
+                            code = str(item.get("ecode", "")).upper()
+                            if code and code not in target and isinstance(item.get("intro"), str):
+                                target[code] = item["intro"]
+                    self.loaded_from = self.loaded_from or path
         return None
 
     def hms_text(self, ecode: str) -> str:
-        return self.hms.get(ecode.upper(), "")
+        return tr(self.hms.get(ecode.upper()) or self.catalog.lookup("device_hms", ecode) or "")
 
     def error_text(self, ecode: str) -> str:
-        return self.err.get(ecode.upper(), "")
+        return tr(self.err.get(ecode.upper()) or self.catalog.lookup("device_error", ecode) or "")
+
+    def wiki_url(self, ecode: str) -> str:
+        return self.catalog.wiki_url(ecode)
+
+    @staticmethod
+    def catalog_alias(model: str | None) -> str | None:
+        from bambu_monitor import SSDP_MODEL_ALIASES
+        normalized = model.upper() if model else None
+        return SSDP_MODEL_ALIASES.get(normalized, normalized)
 
 
 # ------------------------------------------------------------------ hotend switch timing
