@@ -23,12 +23,15 @@ from __future__ import annotations
 import bisect
 import csv
 import json
+import logging
 import os
 import queue
 import sys
 import time
 import tkinter as tk
 from datetime import datetime
+from itertools import repeat
+from types import SimpleNamespace
 import webbrowser
 from tkinter import filedialog, font, messagebox, ttk
 
@@ -38,15 +41,19 @@ import printer_control as pc  # noqa: E402
 from printer_link import PrinterLink  # noqa: E402
 from printer_discovery import DiscoveryDialog  # noqa: E402
 from printer_inspector import ReportInspector  # noqa: E402
+from printer_history import RingSeries, iter_window  # noqa: E402
+from printer_settings import write_settings  # noqa: E402
+from printer_state import TELEMETRY_TIMEOUT, merged_copy, validate_message  # noqa: E402
 from printer_queries import QUERIES, build_query  # noqa: E402
 from i18n import available_languages, bind_static_text, get_language, set_language, tr  # noqa: E402
-from monitor import HOTEND_NAMES, decode, deep_merge  # noqa: E402
+from monitor import HOTEND_NAMES, decode  # noqa: E402
 from printer_report import SWITCH_STATES, HmsText, SwitchTimer, decode_extras  # noqa: E402
 
 APP_TITLE = "Printer Monitor"
 SETTINGS = os.path.join(os.path.expanduser("~"), ".bambu-printer-monitor.json")
 HISTORY_LIMIT = 12 * 3600          # samples kept (1 per second)
 GAP_SECONDS = 10                   # break lines across longer gaps
+LOGGER = logging.getLogger(__name__)
 
 # Chart colours: reference palette (dataviz skill), light surface. Fixed per entity.
 SURFACE, INK, INK2, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
@@ -117,10 +124,11 @@ class Chart:
         self.draw()
 
     def present(self):
-        return [s for s in self.series if s[0] in self.app.vals]
+        return [s for s in self.series if s[0] in self.app.chart_data().vals]
 
     def draw(self):
         c, app = self.canvas, self.app
+        data = app.chart_data()
         c.delete("all")
         W, H = c.winfo_width(), c.winfo_height()
         if W < 200 or H < 100:
@@ -128,7 +136,7 @@ class Chart:
         L, R, T, B = self.L, self.R, self.T, self.B
         pw, ph = W - L - R, H - T - B
         t0, t1 = app.view_range()
-        i0, i1 = bisect.bisect_left(app.t, t0), len(app.t)
+        i0, i1 = bisect.bisect_left(data.t, t0), bisect.bisect_right(data.t, t1)
         shown = [s for s in self.present() if s[0] not in self.hidden]
 
         # title and legend (click to show/hide)
@@ -148,10 +156,9 @@ class Chart:
         vmax = 0.0
         for key, _, _, tgt in shown:
             for k in (key, tgt):
-                if k and k in app.vals:
-                    vals = [v for v in app.vals[k][i0:i1] if v is not None]
-                    if vals:
-                        vmax = max(vmax, max(vals))
+                if k and k in data.vals:
+                    vmax = max(vmax, max((v for v in iter_window(data.vals[k], i0, i1)
+                                        if v is not None), default=0))
         if self.fixed_max:
             y0, y1 = 0.0, float(self.fixed_max)
         else:
@@ -179,22 +186,23 @@ class Chart:
             tt += tstep
 
         # hotend switch markers
-        for mt, name in app.switches:
+        for mt, name in data.switches:
             if t0 <= mt <= t1:
                 xx = self._x(mt)
                 c.create_line(xx, T, xx, T + ph, fill=INK2, dash=(2, 3))
                 c.create_text(xx + 3, T + 2, text="→" + name, anchor="nw", font=app.f_small, fill=INK2)
 
         # lines (targets first, dashed)
-        stride = max(1, (i1 - i0) // (pw * 2)) if pw > 0 else 1
+        stride = max(1, (i1 - i0 + pw - 1) // pw) if pw > 0 else 1
+        visible_times = list(iter_window(data.t, i0, i1))
         for key, _, colour, tgt in shown:
-            if tgt and tgt in app.vals:
-                for run in self._runs(app.vals[tgt], i0, i1, stride, step=True):
+            if tgt and tgt in data.vals:
+                for run in self._runs(data.vals[tgt], i0, i1, stride, step=True, times=visible_times):
                     c.create_line(*run, fill=colour, width=1.5, dash=(4, 3))
         ends = []
         for key, label, colour, _ in shown:
             last = None
-            for run in self._runs(app.vals[key], i0, i1, stride, step=self.step):
+            for run in self._runs(data.vals[key], i0, i1, stride, step=self.step, times=visible_times):
                 c.create_line(*run, fill=colour, width=2)
                 last = run
             if last:
@@ -212,62 +220,70 @@ class Chart:
                 c.create_text(lx + 14, ly, text=tr(label), anchor="w", font=app.f_small, fill=INK2)
         self.draw_hover()
 
-    def _runs(self, vals, i0, i1, stride, step):
-        app, runs, cur, prev_t, prev_v = self.app, [], [], None, None
-        idx = list(range(i0, i1, stride))
-        if idx and idx[-1] != i1 - 1:
-            idx.append(i1 - 1)
-        for i in idx:
-            v, t = vals[i], app.t[i]
-            if v is None or (prev_t is not None and t - prev_t > max(GAP_SECONDS, stride * 2)):
-                if len(cur) >= 4:
-                    runs.append(cur)
-                cur, prev_v = [], None
-                if v is None:
-                    prev_t = None
-                    continue
-            x, y = self._x(t), self._y(v)
-            if not cur:
-                cur = [x, y]
-            elif step:
-                if v != prev_v:
-                    cur += [x, cur[-1], x, y]
-            else:
-                cur += [x, y]
-            prev_t, prev_v = t, v
-        if cur:
-            if step and prev_t is not None:
-                cur += [self._x(prev_t), cur[-1]]
+    def _runs(self, vals, i0, i1, stride, step, times=None):
+        """Reduce continuous runs by bucket extrema, preserving gaps and peaks."""
+        if times is None:
+            times = list(iter_window(self.app.chart_data().t, i0, i1))
+        vals = list(iter_window(vals, i0, i1))
+        i, i1 = 0, len(vals)
+        while i < i1:
+            if vals[i] is None:
+                i += 1
+                continue
+            start = i
+            i += 1
+            while i < i1 and vals[i] is not None and times[i] - times[i - 1] <= GAP_SECONDS:
+                i += 1
+            stop = i
+            cur, previous = [], None
+            for bucket in range(start, stop, stride):
+                end = min(bucket + stride, stop)
+                low = min(range(bucket, end), key=vals.__getitem__)
+                high = max(range(bucket, end), key=vals.__getitem__)
+                for index in sorted({bucket, low, high, end - 1}):
+                    value = vals[index]
+                    x, y = self._x(times[index]), self._y(value)
+                    if not cur:
+                        cur = [x, y]
+                    elif step:
+                        if value != previous:
+                            cur.extend((x, cur[-1], x, y))
+                    else:
+                        cur.extend((x, y))
+                    previous = value
+            if step and cur:
+                cur.extend((self._x(times[stop - 1]), cur[-1]))
             if len(cur) == 2:
-                cur += [cur[0] + 1, cur[1]]
-            runs.append(cur)
-        return runs
+                cur.extend((cur[0], cur[1]))
+            if cur:
+                yield cur
 
     def draw_hover(self):
         c, app = self.canvas, self.app
+        data = app.chart_data()
         c.delete("hover")
-        if app.hover_t is None or not self.geom or not app.t:
+        if app.hover_t is None or not self.geom or not data.t:
             return
         L, T, pw, ph, t0, t1, *_ = self.geom
-        i = min(max(bisect.bisect_left(app.t, app.hover_t), 0), len(app.t) - 1)
-        if i > 0 and abs(app.t[i - 1] - app.hover_t) < abs(app.t[i] - app.hover_t):
+        i = min(max(bisect.bisect_left(data.t, app.hover_t), 0), len(data.t) - 1)
+        if i > 0 and abs(data.t[i - 1] - app.hover_t) < abs(data.t[i] - app.hover_t):
             i -= 1
-        t = app.t[i]
+        t = data.t[i]
         if not t0 <= t <= t1:
             return
         x = self._x(t)
         c.create_line(x, T, x, T + ph, fill=INK2, tags="hover")
         rows = [(None, time.strftime("%H:%M:%S", time.localtime(t))
-                 + (f"  ·  {app.active[i]}" if app.active[i] else ""))]
+                  + (f"  ·  {data.active[i]}" if data.active[i] else ""))]
         for key, label, colour, tgt in self.present():
             if key in self.hidden:
                 continue
-            v = app.vals[key][i]
+            v = data.vals[key][i]
             if v is None:
                 continue
             txt = f"{tr(label)}  {v:g} {self.unit}"
-            if tgt and tgt in app.vals and app.vals[tgt][i]:
-                txt += f"  (target {app.vals[tgt][i]:g})"
+            if tgt and tgt in data.vals and data.vals[tgt][i]:
+                txt += f"  (target {data.vals[tgt][i]:g})"
             rows.append((colour, txt))
             if v is not None:
                 c.create_oval(x - 4, self._y(v) - 4, x + 4, self._y(v) + 4, fill=colour,
@@ -296,28 +312,31 @@ class HotendStrip:
 
     def draw(self):
         c, app = self.canvas, self.app
+        data = app.chart_data()
         c.delete("all")
         W = c.winfo_width()
         L, R = Chart.L, Chart.R
         pw = W - L - R
-        if pw < 50 or not app.t:
+        if pw < 50 or not data.t:
             return
         t0, t1 = app.view_range()
         c.create_text(L - 6, 11, text=tr("Hotend"), anchor="e", font=app.f_small, fill=MUTED)
         X = lambda t: L + (t - t0) / max(t1 - t0, 1e-9) * pw  # noqa: E731
-        i0 = bisect.bisect_left(app.t, t0)
+        i0, i1 = bisect.bisect_left(data.t, t0), bisect.bisect_right(data.t, t1)
         seg_start, seg_name = None, None
-        for i in range(i0, len(app.t) + 1):
-            name = app.active[i] if i < len(app.t) else None
-            if name != seg_name or i == len(app.t):
+        for i in range(i0, i1 + 1):
+            name = data.active[i] if i < i1 else None
+            gap = i > i0 and i < i1 and data.t[i] - data.t[i - 1] > GAP_SECONDS
+            if name != seg_name or i == i1 or gap:
                 if seg_name:
-                    xa, xb = X(max(seg_start, t0)), X(app.t[i - 1])
+                    xa, xb = X(max(seg_start, t0)), X(data.t[i - 1])
                     dark = seg_name == "Aux"
-                    c.create_rectangle(xa, 3, max(xb, xa + 1), 19, fill=INK2 if dark else AXIS, outline="")
+                    c.create_rectangle(xa, 3, min(L + pw, max(xb, xa + 1)), 19,
+                                       fill=INK2 if dark else AXIS, outline="")
                     if xb - xa > 40:
                         c.create_text((xa + xb) / 2, 11, text=tr(seg_name), font=app.f_small,
                                       fill="#ffffff" if dark else INK)
-                seg_start, seg_name = (app.t[i] if i < len(app.t) else None), name
+                seg_start, seg_name = (data.t[i] if i < i1 else None), name
 
 
 # --------------------------------------------------------------------------- app
@@ -337,18 +356,20 @@ class App:
         self.f_small_m, self.f_bold_m = self.f_small, self.f_bold
 
         self.q: queue.Queue = queue.Queue()
+        self._closing = False
         self.link: PrinterLink | None = None
         self.state: dict = {}
         self.extras: dict = {}
-        self.t: list = []
+        self.t = RingSeries(HISTORY_LIMIT)
         self.vals: dict = {}
-        self.active: list = []
-        self.stage_hist: list = []
+        self.active = RingSeries(HISTORY_LIMIT)
+        self.stage_hist = RingSeries(HISTORY_LIMIT)
         self.switches: list = []
         self.prev = None
         self.prev_x: dict = {}
         self.hover_t = None
         self.frozen_at = None
+        self.frozen_data = None
         self.last_msg = 0.0
         self.msg_times: list = []
         self.timer = SwitchTimer()
@@ -359,6 +380,7 @@ class App:
         self.alert_links: dict = {}
         self.inspector = ReportInspector()
         self.inspector_revision = -1
+        self.inspector_rows = {}
         self.pending_query = None
         self.raw_fh = None
         self.raw_count = 0
@@ -369,7 +391,7 @@ class App:
         self.settings = self._load_settings()
         set_language(self.settings.get("language", "cs"))
         self._build()
-        self._text_bindings = bind_static_text(root, exclude=(self.status_lbl, self.alert_lbl, self.ctl_msg,
+        self._text_bindings = bind_static_text(root, exclude=(self.status_lbl, self.data_age_lbl, self.alert_lbl, self.ctl_msg,
             self.raw_lbl, self.switch_lbl, self.freeze_btn, self.connect_btn, self.raw_btn, self.ams_frame))
         self._set_status("off", "Not connected")
         self.connect_btn.configure(text=tr("Connect"))
@@ -395,14 +417,17 @@ class App:
                 "all_fans": bool(self.log_all_fans.get()),
                 "passive": bool(self.passive.get()), "cert_file": self.cert_file.get().strip(),
                 "model": self.model.get().strip(), "language": get_language()}
+        trusted = dict(self.settings.get("trusted_printers") or {})
+        if data["ip"] and data["cert_file"]:
+            trusted[data["ip"].casefold()] = {"serial": data["serial"], "cert_file": data["cert_file"]}
+        data["trusted_printers"] = trusted
         if self.remember.get():
             data["code"] = self.code.get().strip()
         try:
-            with open(SETTINGS, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=1)
-            os.chmod(SETTINGS, 0o600)
-        except OSError:
-            pass
+            write_settings(SETTINGS, data)
+            self.settings = data
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("Could not save monitor preferences: %s", exc)
 
     # ---- layout
     def _build(self) -> None:
@@ -447,6 +472,8 @@ class App:
         self.status_dot.grid(row=4, column=0, sticky="w")
         self.status_lbl = ttk.Label(conn, text="Not connected")
         self.status_lbl.grid(row=4, column=1, columnspan=8, sticky="w", padx=(4, 0))
+        self.data_age_lbl = ttk.Label(conn, text=tr("No telemetry received yet."), foreground=MUTED)
+        self.data_age_lbl.grid(row=5, column=1, columnspan=8, sticky="w", padx=(4, 0))
         self._set_status("off", "Not connected")
         for w in conn.winfo_children():
             if isinstance(w, ttk.Entry):
@@ -732,7 +759,7 @@ class App:
 
     def _controls_live(self) -> bool:
         return bool(self.ctl_on.get() and self.link and not self.link.passive and self.link.online and self.state.get("print")
-                    and time.time() - self.last_msg < 60)
+                    and self.last_msg and time.monotonic() - self.last_msg <= TELEMETRY_TIMEOUT)
 
     def _refresh_controls(self) -> None:
         """Enable what the printer can do now and show its current light, speed and air duct mode."""
@@ -766,7 +793,8 @@ class App:
                 self.sound_chk.pack_forget()
         single = not c["extruder_ids"]
         for key, (var, ent, btn) in self.temp_entries.items():
-            on = {"Main": True, "Aux": not single, "bed": True, "chamber": c["has_chamber"]}[key]
+            on = {"Main": c["nozzle_ready"], "Aux": c["nozzle_ready"] and not single,
+                  "bed": True, "chamber": c["has_chamber"]}[key]
             able(ent, on)
             able(btn, on)
 
@@ -965,8 +993,10 @@ class App:
         self.serial.set(candidate.serial or (candidate.certificate.common_name if candidate.certificate else "") or "")
         model = candidate.model or ""
         self.model.set(lan.SSDP_MODEL_ALIASES.get(model.upper(), model))
-        # Never reuse a different printer's saved trust when changing devices.
-        self.cert_file.set(cert_file)
+        trusted = (self.settings.get("trusted_printers") or {}).get(str(candidate.ip).casefold(), {})
+        # Restore trust only for the same host and serial, never another device.
+        saved = trusted.get("cert_file", "") if trusted.get("serial") == self.serial.get() else ""
+        self.cert_file.set(cert_file or saved)
 
     def _connection_editable(self, editable):
         for widget in self.connection_widgets:
@@ -983,6 +1013,7 @@ class App:
         self.sent.clear()
         self.inspector = ReportInspector()
         self.inspector_revision = -1
+        self.inspector_rows.clear()
         self.pending_query = None
         self.hold.clear()
         self.ams_sig = self.sensor_sig = None
@@ -1004,6 +1035,7 @@ class App:
             self.q = queue.Queue()  # isolate late messages from the stopped worker
             self.pending_query = None
             self.ctl_on.set(False)
+            self._invalidate_telemetry()
             self.connect_btn.config(text=tr("Connect"))
             self._connection_editable(True)
             self._set_status("off", "Disconnected")
@@ -1035,35 +1067,29 @@ class App:
         self._save_settings()
 
     def _drain(self):
+        # Bound a burst so drawing and user input still get a turn in Tk's loop.
+        deadline = time.monotonic() + 0.02
         try:
-            while True:
+            for _ in range(100):
+                if time.monotonic() >= deadline:
+                    break
                 kind, data = self.q.get_nowait()
                 if kind == "msg":
-                    now = time.time()
-                    self.inspector.observe(data, now)
-                    self._query_response(data)
-                    if self._is_reply(data):   # answer to a command: not part of the status
-                        if self.raw_fh:
-                            self.raw_fh.write(json.dumps({"t": round(now, 3), "msg": data}) + "\n")
-                            self.raw_count += 1
-                        continue
-                    deep_merge(self.state, data)
-                    self.last_msg = now
-                    self.msg_times = (self.msg_times + [now])[-60:]
-                    if self.raw_fh:
-                        self.raw_fh.write(json.dumps({"t": round(now, 3), "msg": data}) + "\n")
-                        self.raw_count += 1
-                    self._on_message(now)
+                    try:
+                        self._receive_message(data)
+                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, OverflowError, RecursionError) as exc:
+                        LOGGER.warning("Ignored invalid printer report: %s", exc)
                 elif kind == "serial":
                     if not self.serial.get().strip():
                         self.serial.set(data)
                     self.hms.load(data, lang=get_language(), model=self.model.get().strip() or None)
                 elif kind == "status":
                     if data[0] != "ok":
-                        self.last_msg = 0.0  # require a fresh report after reconnect
+                        self._invalidate_telemetry()
                     self._set_status(*data)
                     self._refresh_controls()
                 elif kind in ("auth", "fatal"):
+                    self._invalidate_telemetry()
                     self._set_status("error", data)
                     self.link = None
                     self.connect_btn.config(text=tr("Connect"))
@@ -1071,18 +1097,82 @@ class App:
                     self._refresh_controls()
         except queue.Empty:
             pass
-        self.root.after(200, self._drain)
+        finally:
+            if not self._closing:
+                self.root.after(10 if not self.q.empty() else 200, self._drain)
 
-    def _on_message(self, now):
+    def _receive_message(self, data):
+        now, elapsed = time.time(), time.monotonic()
+        if self.last_msg and elapsed - self.last_msg > TELEMETRY_TIMEOUT:
+            self._invalidate_telemetry(clear_age=False)
+        self._record_raw({"t": round(now, 3), "monotonic": elapsed, "msg": data})
+        validate_message(data)
+        if self._is_reply(data):
+            self.inspector.observe(data, now)
+            self._query_response(data)
+            return
+        if not data.get("print"):
+            self.inspector.observe(data, now)
+            return
+        candidate = merged_copy(self.state, data)
+        p = candidate["print"]
+        # Decode before commit: malformed deltas cannot corrupt the last good state.
+        decode(p)
+        extras = decode_extras(p)
+        pc.decode_controls(p)
+        lan.sensor_summary(candidate)
+        self.state, self.extras = candidate, extras
+        self.inspector.observe(data, now)
+        self._query_response(data)
+        self.last_msg = elapsed
+        self.msg_times = (self.msg_times + [elapsed])[-60:]
+        self._on_message(now, monotonic=elapsed)
+
+    def _invalidate_telemetry(self, clear_age=True):
+        had_data = bool(self.state)
+        self.state, self.extras = {}, {}
+        self.prev, self.prev_x = None, {}
+        self.timer.interrupt()
+        self.msg_times = []
+        self.sent.clear()
+        self.pending_query = None
+        self.hold.clear()
+        if clear_age:
+            self.last_msg = 0.0
+        if had_data:
+            self._record_raw({"t": time.time(), "event": "telemetry_gap"})
+            # Existing alert rows remain history; a disconnect is not an all-clear.
+            self.alerts.clear()
+            self._update_values(decode({}), {})
+            for label in self.value_labels.values():
+                label.configure(text="—")
+            self._update_ams({})
+            self._update_sensors()
+            self._set_alert_dot("off")
+            self.alert_lbl.configure(text=tr("Alerts unavailable until a fresh report arrives."))
+
+    def _update_data_age(self):
+        if not self.last_msg:
+            text, colour = "No telemetry received yet.", MUTED
+        else:
+            age = max(0, time.monotonic() - self.last_msg)
+            stale = age > TELEMETRY_TIMEOUT
+            text = tr("Telemetry stale: last report {seconds:.0f} s ago." if stale
+                      else "Last telemetry {seconds:.0f} s ago.", seconds=age)
+            colour = STATUS["error"] if stale else INK2
+            if stale and self.state:
+                self._invalidate_telemetry(clear_age=False)
+        self.data_age_lbl.configure(text=tr(text), foreground=colour)
+
+    def _on_message(self, now, *, monotonic=None):
         """Per report: decode extras and time hotend switches with message precision."""
         p = self.state.get("print")
         if not p:
             return
-        self.extras = decode_extras(p)
-        rec = self.timer.feed(now, self.extras, layer=p.get("layer_num"), names=lambda i: HOTEND_NAMES.get(i, i))
+        rec = self.timer.feed(now, self.extras, layer=p.get("layer_num"),
+                              names=lambda i: HOTEND_NAMES.get(i, i), monotonic=monotonic)
         if rec:
-            recs = self.timer.records
-            gap = (rec["start"] - recs[-2]["end"]) if len(recs) > 1 else None
+            gap = rec.get("gap")
             dur = "not timed" if rec["duration"] is None else f"{rec['duration']:.1f}"
             steps = ", ".join(rec["steps"]) or "—"
             self.sw_tree.insert("", "end", values=(
@@ -1095,17 +1185,24 @@ class App:
 
     # ---- sampling
     def _tick(self):
+        if self._closing:
+            return
         self.root.after(1000, self._tick)
+        self._update_data_age()
         self._refresh_controls()
         self._update_inspector()
         if self.pending_query and time.monotonic() - self.pending_query[2] > 15:
             self.query_status.configure(text=tr("No matching response within 15 s. The firmware may not support this query; missing data is not zero."))
             self.pending_query = None
         if self.raw_fh:
-            self.raw_fh.flush()
-            self.raw_lbl.config(text=f"recording: {self.raw_count} messages")
+            try:
+                self.raw_fh.flush()
+                self.raw_lbl.config(text=tr("Recording: {count} messages", count=self.raw_count))
+            except (OSError, ValueError) as exc:
+                self._stop_raw(error=exc)
         p = self.state.get("print")
-        if not self.link or not p or time.time() - self.last_msg > 60:
+        if not self.link or not self.link.online or not p or not self.last_msg \
+                or time.monotonic() - self.last_msg > TELEMETRY_TIMEOUT:
             return
         d = decode(p)
         x = self.extras or decode_extras(p)
@@ -1115,21 +1212,14 @@ class App:
         for name, val in d["fans"].items():
             sample["fan_" + name] = val
         n = len(self.t)
+        for k, v in sample.items():
+            if v is not None and k not in self.vals:
+                self.vals[k] = RingSeries(HISTORY_LIMIT, repeat(None, n))
+        for k, series in self.vals.items():
+            series.append(sample.get(k))
         self.t.append(now)
         self.active.append(d.get("active") if isinstance(d.get("active"), str) else None)
         self.stage_hist.append(x.get("stage"))
-        for k, v in sample.items():
-            if v is None and k not in self.vals:
-                continue
-            self.vals.setdefault(k, [None] * n).append(v)
-        for k, lst in self.vals.items():
-            if len(lst) < n + 1:
-                lst.append(None)
-        if len(self.t) > HISTORY_LIMIT:
-            cut = len(self.t) - HISTORY_LIMIT
-            self.t, self.active, self.stage_hist = self.t[cut:], self.active[cut:], self.stage_hist[cut:]
-            for k in self.vals:
-                self.vals[k] = self.vals[k][cut:]
         self._events(d, x)
         self._alerts(x)
         self._update_values(d, x)
@@ -1272,15 +1362,29 @@ class App:
         if not force and self.notebook.select() != str(self.field_tree.master):
             return
         self.inspector_revision = self.inspector.revision
-        self.field_tree.delete(*self.field_tree.get_children())
         search = self.field_filter.get().casefold().strip()
         fields = [(path, field) for path, field in sorted(self.inspector.fields.items())
                   if not search or search in path.casefold() or search in str(field.value).casefold()]
-        for path, field in fields[:2000]:
+        shown = fields[:2000]
+        paths = {path for path, _ in shown}
+        old_order = self.field_tree.get_children()
+        for path in old_order:
+            if path not in paths:
+                self.field_tree.delete(path)
+                self.inspector_rows.pop(path, None)
+        for path, field in shown:
             value = json.dumps(field.value, ensure_ascii=False)
             previous = json.dumps(field.previous, ensure_ascii=False) if field.changes else ""
-            self.field_tree.insert("", "end", values=(path, value[:500], previous[:200], field.changes,
-                datetime.fromtimestamp(field.seen).strftime("%H:%M:%S"), tr(self.inspector.hint(path))))
+            values = (path, value[:500], previous[:200], field.changes,
+                datetime.fromtimestamp(field.seen).strftime("%H:%M:%S"), tr(self.inspector.hint(path)))
+            if not self.field_tree.exists(path):
+                self.field_tree.insert("", "end", iid=path, values=values)
+            elif self.inspector_rows.get(path) != values:
+                self.field_tree.item(path, values=values)
+            self.inspector_rows[path] = values
+        if old_order != tuple(path for path, _ in shown):
+            for index, (path, _) in enumerate(shown):
+                self.field_tree.move(path, "", index)
         self.field_count.configure(text=tr("{shown} / {total} fields", shown=min(2000, len(fields)), total=len(fields)))
 
     def _export_inspector(self):
@@ -1408,11 +1512,15 @@ class App:
                 ttk.Label(cell, text=txt).pack(side="left", padx=(4, 0))
 
     # ---- view
+    def chart_data(self):
+        return self.frozen_data if self.frozen_data is not None else self
+
     def view_range(self):
-        end = self.frozen_at or (self.t[-1] if self.t else time.time())
+        data = self.chart_data()
+        end = self.frozen_at if self.frozen_at is not None else (data.t[-1] if data.t else time.time())
         span = dict(WINDOWS).get(self.window.get(), 600)
         if span is None:
-            start = self.t[0] if self.t else end - 600
+            start = data.t[0] if data.t else end - 600
             span = max(end - start, 60)
         return end - span, end
 
@@ -1427,34 +1535,66 @@ class App:
         self.fan_chart.draw_hover()
 
     def toggle_freeze(self):
-        self.frozen_at = None if self.frozen_at else (self.t[-1] if self.t else time.time())
-        self.freeze_btn.config(text=tr("Follow live" if self.frozen_at else "Freeze view"))
+        if self.frozen_data is None:
+            self.frozen_at = self.t[-1] if self.t else time.time()
+            self.frozen_data = SimpleNamespace(t=list(self.t), active=list(self.active),
+                vals={key: list(values) for key, values in self.vals.items()}, switches=list(self.switches))
+        else:
+            self.frozen_at = self.frozen_data = None
+        self.freeze_btn.config(text=tr("Follow live" if self.frozen_data is not None else "Freeze view"))
         self.redraw()
 
     def clear(self):
-        self.t, self.vals, self.active, self.stage_hist, self.switches = [], {}, [], [], []
+        self.t, self.active, self.stage_hist = (RingSeries(HISTORY_LIMIT) for _ in range(3))
+        self.vals, self.switches = {}, []
+        self.frozen_at = self.frozen_data = self.hover_t = None
+        self.freeze_btn.configure(text=tr("Freeze view"))
         self.timer.records = []
+        self.timer.interrupt()
         for iid in self.sw_tree.get_children():
             self.sw_tree.delete(iid)
         self.switch_lbl.config(text=tr("Hotend switches: none measured yet"), foreground=INK2)
         self.redraw()
 
+    def _stop_raw(self, error=None):
+        handle, self.raw_fh = self.raw_fh, None
+        if handle:
+            try:
+                handle.close()
+            except (OSError, ValueError) as exc:
+                error = error or exc
+        self.raw_btn.config(text=tr("Record raw…"))
+        text = tr("Recording stopped: {error}", error=error) if error else tr("Saved {count} messages", count=self.raw_count)
+        self.raw_lbl.config(text=text)
+        if error:
+            self._log(text, "alert")
+
+    def _record_raw(self, record):
+        if not self.raw_fh:
+            return
+        try:
+            self.raw_fh.write(json.dumps(record) + "\n")
+            self.raw_count += int("msg" in record)
+        except (OSError, ValueError) as exc:
+            self._stop_raw(error=exc)
+
     def toggle_raw(self):
         if self.raw_fh:
-            self.raw_fh.close()
-            self.raw_fh = None
-            self.raw_btn.config(text=tr("Record raw…"))
-            self.raw_lbl.config(text=f"saved {self.raw_count} messages")
+            self._stop_raw()
             return
         path = filedialog.asksaveasfilename(defaultextension=".jsonl", filetypes=[("JSON lines", "*.jsonl")],
                                             initialfile=f"printer-raw-{datetime.now():%Y%m%d-%H%M}.jsonl")
         if not path:
             return
-        self.raw_fh = open(path, "a", encoding="utf-8")
+        try:
+            self.raw_fh = open(path, "a", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(tr("Recording failed"), str(exc))
+            return
         self.raw_count = 0
-        if self.state:  # start with the full merged state so the file is usable on its own
-            self.raw_fh.write(json.dumps({"t": round(time.time(), 3), "merged_state": self.state}) + "\n")
         self.raw_btn.config(text=tr("Stop recording"))
+        if self.state:  # start with the full merged state so the file is usable on its own
+            self._record_raw({"t": round(time.time(), 3), "monotonic": time.monotonic(), "merged_state": self.state})
 
     def save_csv(self):
         if not self.t:
@@ -1485,9 +1625,10 @@ class App:
                                 rec["layer"], "; ".join(rec["steps"])])
 
     def close(self):
+        self._closing = True
         self._save_settings()
         if self.raw_fh:
-            self.raw_fh.close()
+            self._stop_raw()
         if self.link:
             self.link.stop()
         self.root.destroy()

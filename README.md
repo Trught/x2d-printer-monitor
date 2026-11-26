@@ -2,7 +2,7 @@
 
 Live status window for a **Bambu Lab X2D** on your local network. It shows temperatures, fans, both hotends, the AMS and alerts, with charts, and measures how long each hotend switch takes.
 
-It works without Bambu Studio, Bambu Handy or the cloud. By default it is **read-only**: the only message it sends to the printer is the standard "send me the full status" request. It can also pause, resume or stop a print and set the light, speed, air duct mode and target temperatures, but only after you tick **Enable controls** (see [Controls](#controls)).
+It works without Bambu Studio, Bambu Handy or the cloud. The window defaults to **Passive MQTT**: it subscribes to reports and sends no commands or status requests. Disconnect and turn off Passive MQTT to allow full-status requests and read queries. It can also pause, resume or stop a print and set the light, speed, air duct mode and target temperatures, but only after you additionally tick **Enable controls** (see [Controls](#controls)).
 
 ![Printer Monitor window with the Controls row enabled](docs/screenshot.jpg)
 
@@ -44,16 +44,20 @@ Then:
 2. Leave **Serial** empty. The monitor reads it from the printer and fills it in.
 3. Press **Connect** (or Return). The dot turns green and values appear within a second or two.
 
-Tick **Remember access code on this computer** if you don't want to type it each time. It's saved in plain text in `~/.bambu-printer-monitor.json` (readable only by your user account). The IP address and chart range are always remembered.
+Tick **Remember access code on this computer** if you don't want to type it each time. It's saved in plain text in `~/.bambu-printer-monitor.json`. The IP address and chart range are always remembered. Settings are saved atomically, so a failed save keeps the previous file intact. No keyring or additional GUI dependency is required.
 
 If the network drops, the monitor reconnects by itself every 5 seconds. A wrong access code stops it with **Login refused**.
+
+The status line also shows the age of the latest telemetry. After 15 seconds without a report, live values become unavailable and controls are disabled. A disconnect discards the merged live state and any unfinished switch measurement, while retaining recorded history. In passive mode, values reappear only as the printer reports them; with status requests enabled, the transport requests full status after subscribing again.
+
+**Discover LAN…** can find printers and show their TLS certificate fingerprints. Use **Save certificate…** to save a certificate after checking it through a trusted path, then select the printer. The monitor remembers the certificate path for that IP and serial number. An empty Trusted certificate field keeps the original unverified TLS mode.
 
 ## Using it
 
 | Control | What it does |
 |---|---|
 | **Show last** | chart range: 2 min, 10 min, 30 min, 2 h or All |
-| **Freeze view** | stops the charts scrolling so you can study them; recording continues |
+| **Freeze view** | keeps a snapshot of the displayed history, even when live history rolls over; recording continues |
 | **Clear history** | empties the charts and the switch list |
 | **Save CSV…** | saves everything recorded, plus `…-switches.csv` if there were switches |
 | **Record raw… / Stop recording** | saves every printer message to a `.jsonl` file until you stop it |
@@ -68,7 +72,7 @@ The tabs at the bottom:
 
 ### Controls
 
-The Controls row is greyed out until you tick **Enable controls**. The tick is not remembered, so the window is read-only again the next time you start it. The printer must be in **Developer Mode** to accept commands over the LAN.
+To use the Controls row, disconnect, turn off **Passive MQTT**, reconnect and tick **Enable controls**. The tick is not remembered, so the controls are disabled again the next time you start it. The printer must be in **Developer Mode** to accept commands over the LAN. Nozzle controls also wait for enough hotend information to avoid treating a partial dual-hotend report as a single-hotend printer.
 
 - **Pause**, **Resume**, **Stop…**: each is available only in the matching print state. Stop asks first.
 - **Chamber light**: on or off.
@@ -83,12 +87,12 @@ Setting hotend and bed targets has been confirmed on a real X2D (the Events tab 
 
 ### Alert texts
 
-The printer sends only alert codes. The text comes from the alert files that Bambu Studio downloads. Connect Bambu Studio to the printer once on the same computer, and the monitor finds the files by itself:
+The printer sends only alert codes. The monitor prefers local alert files downloaded by Bambu Studio and falls back to the bundled model-aware catalog. Connect Bambu Studio to the printer once on the same computer, and the monitor finds the local files by itself:
 
 - macOS: `~/Library/Application Support/BambuStudio/hms/`
 - Windows: `%APPDATA%\BambuStudio\hms\`
 
-Without them, alerts are still shown, as codes.
+If neither source contains a matching message, the alert is still shown as a code.
 
 ### How switch times are measured
 
@@ -98,6 +102,9 @@ Each printer message says which hotend is active and whether the hotends are idl
 - A switch that happens entirely between two messages is counted but marked **not timed**.
 - Busy periods that end on the same hotend (loading or unloading filament) are not counted as switches.
 - The time shown is the printer's own "switching" phase. Wiping and reheating before and after it are not included.
+- Durations and gaps use a monotonic clock, so changing the computer's clock does not change the measurements. A switch interrupted by lost or stale telemetry is discarded instead of including the missing time.
+
+Long chart ranges retain the minimum and maximum in each display bucket, including short temperature and fan peaks. Missing samples and time gaps remain breaks in the lines.
 
 ## Terminal version (optional)
 
@@ -149,17 +156,25 @@ The monitor is written and tested for the X2D. Printers that send the same field
 
 | File | Purpose |
 |---|---|
-| `printer_gui.py` | the window, charts and the built-in MQTT client |
+| `printer_gui.py` | the window, charts and user controls |
+| `printer_link.py` | standard-library MQTT transport, passive-mode enforcement and reconnects |
+| `printer_state.py` | incremental state merging and validation |
+| `printer_history.py` | bounded, indexable circular history |
+| `printer_settings.py` | atomic saves of the existing local JSON settings |
 | `printer_report.py` | decoding of stage, speed, nozzles, AMS, alerts and switch timing |
 | `printer_control.py` | the command messages for the Controls row |
 | `monitor.py` | temperature and fan decoding (shared) and the terminal version |
+| `replay.py` | offline replay and inspection of raw JSONL recordings |
+| `tests/` | offline regression tests and Tk smoke tests |
 | `Printer Monitor.command` / `.bat` | double-click launchers for macOS / Windows |
 
 Keep your CSV and raw recordings, and your access code, out of this repository. `.gitignore` already excludes `*.csv` and `*.jsonl`.
 
 ## How it works
 
-The printer runs an MQTT server on port 8883 (TLS, user `bblp`, password = the access code). The monitor subscribes to `device/<serial>/report` and sends one `pushall` request to `device/<serial>/request` every 5 minutes. The printer then sends a full status message, and small change messages in between. The serial number is read from the printer's TLS certificate. The printer uses a self-signed certificate, so it isn't verified.
+The printer runs an MQTT server on port 8883 (TLS, user `bblp`, password = the access code). The window subscribes to `device/<serial>/report`. When Passive MQTT is turned off, it sends a `pushall` request to `device/<serial>/request` after subscription and every 5 minutes. The printer sends full status and small change messages, which the monitor merges. The serial number is read from the printer's TLS certificate. A saved certificate can be selected for verification; otherwise TLS identity remains unverified.
+
+Malformed reports are rejected before changing live state. A raw-log write, flush or close failure stops recording and reports the error without stopping monitoring. Incoming bursts are processed in bounded batches so the GUI can continue handling input.
 
 Field decoding follows the open-source device code of [Bambu Studio](https://github.com/bambulab/BambuStudio) (version 02.09.01.70), mainly `src/slic3r/GUI/DeviceCore/`:
 
@@ -190,6 +205,25 @@ Commands sent by the Controls row, all to `device/<serial>/request` (`sequence_i
 | Prompt sound | `{"print": {"command": "print_option", "sound_enable": true \| false}}` | `DevPrintOptions.cpp` |
 
 Bambu's closed networking plugin is not used.
+
+## Offline checks and replay
+
+Run the regression tests without a printer or extra packages:
+
+```sh
+python -B -m unittest discover -s tests -v
+```
+
+The tests cover invalid reports, disk errors, reconnects, monotonic switch timing, circular-history rollover, frozen charts, short peaks and local settings. Tk smoke tests are skipped if Tk or a display is unavailable. GitHub Actions runs the suite on Windows, macOS and Linux with Python 3.9 and 3.13.
+
+To inspect a raw recording without connecting to a printer:
+
+```sh
+python replay.py tests/fixtures/switch-trace.jsonl
+python replay.py your-recording.jsonl
+```
+
+The replay prints JSON with report counts, switch measurements, final merged state and rejected-line details. It exits with status 1 if any entries were rejected. Existing recordings with only `t` timestamps are supported; new recordings also include monotonic timestamps and explicit telemetry-gap markers. The bundled fixture contains synthetic data only.
 
 ## Credits and license
 

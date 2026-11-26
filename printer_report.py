@@ -340,12 +340,21 @@ class SwitchTimer:
     """
 
     def __init__(self):
+        self.records: list = []
+        self.interrupt()
+
+    def interrupt(self):
+        """End continuity without inventing a switch across missing telemetry."""
         self.settled = None      # last hotend id while idle
         self.start = None
+        self.start_monotonic = None
+        self.last_end_monotonic = None
         self.steps: list = []
-        self.records: list = []
 
-    def feed(self, t: float, extras: dict, layer=None, names=None):
+    def feed(self, t: float, extras: dict, layer=None, names=None, *, monotonic=None):
+        # t is for displayed timestamps; the separate clock measures durations.
+        # Recorded traces without a monotonic clock can still use their timestamps.
+        elapsed = t if monotonic is None else monotonic
         cur, sw = extras.get("ext_cur"), extras.get("switch_state")
         if cur is None or sw is None:
             return None
@@ -353,6 +362,7 @@ class SwitchTimer:
         started = sw in (1, 2, 3) or not valid or (self.settled is not None and cur != self.settled)
         if started and self.start is None and self.settled is not None:
             self.start, self.steps, self.layer = t, [], layer
+            self.start_monotonic = elapsed
         if self.start is not None:
             for name, h in (extras.get("hotends") or {}).items():
                 step = h.get("step")
@@ -366,12 +376,17 @@ class SwitchTimer:
                 if cur != self.settled:  # busy without a hotend change (e.g. filament load) is not a switch
                     # start == end: the whole switch fell between two reports, so no duration
                     rec = {"start": self.start, "end": t,
-                           "duration": (t - self.start) if t > self.start else None,
+                           "duration": (elapsed - self.start_monotonic)
+                               if elapsed > self.start_monotonic else None,
+                           "gap": (self.start_monotonic - self.last_end_monotonic)
+                               if self.last_end_monotonic is not None else None,
                            "from": names(self.settled) if names else self.settled,
                            "to": names(cur) if names else cur,
                            "layer": self.layer, "steps": list(self.steps)}
                     self.records.append(rec)
+                    self.last_end_monotonic = elapsed
                 self.start = None
+                self.start_monotonic = None
             self.settled = cur
             return rec
         return None
@@ -380,7 +395,7 @@ class SwitchTimer:
         if not self.records:
             return {}
         d = [r["duration"] for r in self.records if r["duration"] is not None]
-        gaps = [b["start"] - a["end"] for a, b in zip(self.records, self.records[1:])]
+        gaps = [r["gap"] for r in self.records if r.get("gap") is not None]
         out = {"count": len(self.records), "timed": len(d),
                "avg_gap": (sum(gaps) / len(gaps)) if gaps else None}
         if d:

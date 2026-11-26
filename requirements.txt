@@ -1,0 +1,2 @@
+# Optional terminal monitors; the graphical monitor uses the standard library.
+paho-mqtt>=2.1,<3

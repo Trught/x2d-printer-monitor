@@ -125,7 +125,10 @@ def decode_controls(p: dict) -> dict:
     # hotends: device ids for set_nozzle_temp; a single hotend uses M104
     info = (dev.get("extruder") or {}).get("info") or []
     ids = sorted(e["id"] for e in info if isinstance(e, dict) and "id" in e)
-    out["extruder_ids"] = ids if len(ids) > 1 else []
+    reported_state = (dev.get("extruder") or {}).get("state")
+    total = bits(reported_state, 0, 4) if reported_state is not None else len(ids)
+    out["extruder_ids"] = ids if total > 1 else []
+    out["nozzle_ready"] = (total > 0 and len(ids) >= total) or "nozzle_temper" in p
 
     duct = dev.get("airduct") or {}
     out["duct_mode"] = duct.get("modeCur")

@@ -180,5 +180,13 @@
   "The heatbed temperature is abnormal; the sensor may have an open circuit.": "Neobvyklá teplota podložky; obvod senzoru může být přerušený.",
   "present": "přítomen",
   "absent": "nepřítomen",
-  "{hotend}: filament {filament}, buffer {buffer}, nozzle {nozzle}": "{hotend}: filament {filament}, buffer {buffer}, tryska {nozzle}"
+  "{hotend}: filament {filament}, buffer {buffer}, nozzle {nozzle}": "{hotend}: filament {filament}, buffer {buffer}, tryska {nozzle}",
+  "No telemetry received yet.": "Zatím nepřišla žádná telemetrie.",
+  "Last telemetry {seconds:.0f} s ago.": "Poslední telemetrie před {seconds:.0f} s.",
+  "Telemetry stale: last report {seconds:.0f} s ago.": "Telemetrie je neaktuální: poslední zpráva před {seconds:.0f} s.",
+  "Alerts unavailable until a fresh report arrives.": "Hlášení nejsou dostupná, dokud nepřijde čerstvá zpráva.",
+  "Recording: {count} messages": "Záznam: {count} zpráv",
+  "Saved {count} messages": "Uloženo {count} zpráv",
+  "Recording stopped: {error}": "Záznam zastaven: {error}",
+  "Recording failed": "Záznam se nezdařil"
 }
