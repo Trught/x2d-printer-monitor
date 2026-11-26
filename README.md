@@ -4,7 +4,7 @@ Live status window for a **Bambu Lab X2D** on your local network. It shows tempe
 
 It works without Bambu Studio, Bambu Handy or the cloud. The window defaults to **Passive MQTT**: it subscribes to reports and sends no commands or status requests. Disconnect and turn off Passive MQTT to allow full-status requests and read queries. It can also pause, resume or stop a print and set the light, speed, air duct mode and target temperatures, but only after you additionally tick **Enable controls** (see [Controls](#controls)).
 
-![Printer Monitor window with the Controls row enabled](docs/screenshot.jpg)
+![Printer Monitor window with the Controls row enabled](docs/screenshot.png)
 
 ## What you get
 
